@@ -10,7 +10,8 @@ import type { HttpClient, HttpResponse } from '../http-client'
  */
 describe('腾讯云 TC3 签名（官方样例）', () => {
   const OFFICIAL = {
-    secretId: 'AKIDz8krbsJ5yKBZQpn74WFkmLPx3EXAMPLE',
+    // 官方样例的 SecretId 只出现在 Credential 里、不参与签名，用占位值即可（官方原值会触发 GitHub 密钥扫描）
+    secretId: 'test-secret-id',
     secretKey: 'Gu5t9xGARNpq86cd98joQYCN3EXAMPLE',
     service: 'cvm',
     host: 'cvm.tencentcloudapi.com',
