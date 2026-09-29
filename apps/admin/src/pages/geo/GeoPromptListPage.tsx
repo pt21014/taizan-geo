@@ -1,0 +1,235 @@
+import { Button, Form, Input, InputNumber, Select, Space, Switch, Tag, Typography } from 'antd'
+import { ImportOutlined, FolderOpenOutlined, RobotOutlined } from '@ant-design/icons'
+import {
+  CrudDrawerForm,
+  CrudTable,
+  Perm,
+  enumColumn,
+  useCrudForm,
+} from '@taizan/admin-ui'
+import {
+  GEO_FUNNEL_STAGE_OPTIONS,
+  GEO_FUNNEL_STAGE_TEXT,
+  useGeoPromptApi,
+  type GeoPrompt,
+  type GeoPromptInput,
+} from '../../api/geo-prompt'
+import { GeoPromptGenerateDrawer } from './GeoPromptGenerateDrawer'
+import { GeoPromptImportDrawer } from './GeoPromptImportDrawer'
+import { GeoPromptSetDrawer } from './GeoPromptSetDrawer'
+import { useBrandOptions } from './hooks/useBrandOptions'
+import { useDrawerState } from './hooks/useDrawerState'
+import { useGeoPromptTable } from './hooks/useGeoPromptTable'
+
+/**
+ * 问法（Prompt）列表：顶部品牌选择器 + CrudTable + 批量导入 / Prompt 集两个抽屉。
+ *
+ * 页面里**没有裸的 `useState` / `useEffect`**（蓝图 §5.2 的 admin-ui 纪律）——
+ * 品牌清单归 `hooks/useBrandOptions.ts`，表格与集清单归 `hooks/useGeoPromptTable.ts`，
+ * 抽屉开关归 `hooks/useDrawerState.ts`，每个文件里都写清了为什么那段状态该在那儿。
+ */
+export default function GeoPromptListPage() {
+  const api = useGeoPromptApi()
+  const brands = useBrandOptions()
+  const brandId = brands.brandId ?? ''
+  const { table, sets, refreshSets } = useGeoPromptTable(brands.brandId)
+
+  const importer = useDrawerState<true>()
+  const setManager = useDrawerState<true>()
+  // 「AI 生成」抽屉。与「批量导入」分开：两者的入口参数、中间状态与落库时机都不同，
+  // 合成一个抽屉的话，那个抽屉里会有两套互斥的表单。
+  const generator = useDrawerState<true>()
+
+  const form = useCrudForm<GeoPromptInput>({
+    create: (values) => api.create({ ...values, brandId }),
+    update: (id, values) => api.update(id, values),
+    onSuccess: table.refresh,
+    quotaMessage: '监测问法数已达套餐上限，去「账单与续费」升一档再来',
+  })
+
+  const setName = (id: string): string => sets.find((s) => s.id === id)?.name ?? '—'
+
+  return (
+    <>
+      <CrudTable<GeoPrompt>
+        table={table}
+        title="监测问法"
+        emptyText={
+          brands.loading
+            ? '加载中…'
+            : brands.options.length === 0
+              ? '这家店还没有监测品牌。先去「品牌管理」建一个，问法才有归属。'
+              : '这个品牌下还没有问法。可以一条条新建，也可以「批量导入」。'
+        }
+        create={{
+          label: '新增问法',
+          perm: 'geo-prompt:write',
+          onClick: () => form.openForm(),
+        }}
+        toolbar={
+          <Space>
+            {/* 品牌选择器：`brandId` 是列表接口的必填参数，所以它在工具栏上而不是
+                搜索表单里——放进搜索表单就能被「重置」清空，而清空之后请求会 400。 */}
+            <Select
+              style={{ minWidth: 200 }}
+              loading={brands.loading}
+              value={brands.brandId}
+              onChange={brands.setBrandId}
+              options={brands.options}
+              placeholder="选一个品牌"
+            />
+            <Perm code="geo-prompt:generate">
+              <Button icon={<RobotOutlined />} onClick={() => generator.openWith(true)}>
+                AI 生成
+              </Button>
+            </Perm>
+            <Perm code="geo-prompt:write">
+              <Button icon={<ImportOutlined />} onClick={() => importer.openWith(true)}>
+                批量导入
+              </Button>
+            </Perm>
+            <Perm code="geo-prompt:list">
+              <Button icon={<FolderOpenOutlined />} onClick={() => setManager.openWith(true)}>
+                Prompt 集
+              </Button>
+            </Perm>
+          </Space>
+        }
+        columns={[
+          {
+            title: '问法',
+            dataIndex: 'text',
+            key: 'text',
+            render: (_value: unknown, row: GeoPrompt) => (
+              <Typography.Text ellipsis={{ tooltip: row.text }} style={{ maxWidth: 420 }}>
+                {row.text}
+              </Typography.Text>
+            ),
+          },
+          enumColumn({
+            title: '阶段',
+            dataIndex: 'funnelStage',
+            map: GEO_FUNNEL_STAGE_TEXT,
+            width: 90,
+          }),
+          {
+            title: '主题',
+            key: 'topic',
+            width: 120,
+            render: (_value: unknown, row: GeoPrompt) => row.topic ?? '-',
+          },
+          {
+            title: 'Prompt 集',
+            key: 'promptSetId',
+            width: 140,
+            render: (_value: unknown, row: GeoPrompt) => setName(row.promptSetId),
+          },
+          {
+            title: '追踪',
+            key: 'isTracked',
+            width: 90,
+            render: (_value: unknown, row: GeoPrompt) =>
+              row.isTracked ? <Tag color="success">追踪中</Tag> : <Tag>已停用</Tag>,
+          },
+          { title: '优先级', dataIndex: 'priority', key: 'priority', width: 80 },
+        ]}
+        actions={[
+          {
+            key: 'edit',
+            label: '编辑',
+            perm: 'geo-prompt:write',
+            onClick: (row) =>
+              form.openWith(row.id, {
+                brandId: row.brandId,
+                promptSetId: row.promptSetId,
+                text: row.text,
+                topic: row.topic ?? '',
+                funnelStage: row.funnelStage,
+                isTracked: row.isTracked,
+                priority: row.priority,
+              }),
+          },
+          {
+            key: 'del',
+            label: '删除',
+            perm: 'geo-prompt:delete',
+            danger: true,
+            confirm: () => '确定删除这条问法？它的历史回答会保留，但不再产生新数据。',
+            onClick: (row) => void table.removeRow(row),
+          },
+        ]}
+      />
+
+      <CrudDrawerForm form={form} title="问法" width={560}>
+        <Form.Item
+          name="text"
+          label="问法正文"
+          rules={[{ required: true, message: '请填问法正文' }]}
+          tooltip="就是运营会拿去问 AI 的那句话。带不带问号会问出不同的回答，所以两者不会被去重合并"
+        >
+          <Input.TextArea rows={3} placeholder="如：钛赞 SaaS 好用吗" />
+        </Form.Item>
+        <Form.Item
+          name="promptSetId"
+          label="Prompt 集"
+          tooltip="不选则归入这个品牌下名为「默认」的集（不存在会自动建一个）"
+        >
+          <Select
+            allowClear
+            placeholder="默认"
+            options={sets.map((set) => ({ label: set.name, value: set.id }))}
+          />
+        </Form.Item>
+        <Form.Item name="topic" label="主题" tooltip="报表按它分组，如「口碑」「选型」">
+          <Input placeholder="选填" />
+        </Form.Item>
+        <Form.Item name="funnelStage" label="漏斗阶段" initialValue="UNKNOWN">
+          <Select options={[...GEO_FUNNEL_STAGE_OPTIONS]} />
+        </Form.Item>
+        <Form.Item
+          name="isTracked"
+          label="纳入自动跑批"
+          valuePropName="checked"
+          initialValue={true}
+          tooltip="关掉之后历史数据保留，但不再产生新查询，也不再占配额"
+        >
+          <Switch />
+        </Form.Item>
+        <Form.Item
+          name="priority"
+          label="优先级"
+          initialValue={0}
+          tooltip="配额不够时优先跑高优先级的（0–100）"
+        >
+          <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
+        </Form.Item>
+      </CrudDrawerForm>
+
+      <GeoPromptGenerateDrawer
+        brandId={brandId}
+        sets={sets}
+        open={generator.open}
+        onClose={generator.close}
+        onImported={table.refresh}
+      />
+
+      <GeoPromptImportDrawer
+        brandId={brandId}
+        sets={sets}
+        open={importer.open}
+        onClose={importer.close}
+        onImported={table.refresh}
+      />
+
+      <GeoPromptSetDrawer
+        brandId={brandId}
+        open={setManager.open}
+        onClose={setManager.close}
+        onChanged={() => {
+          refreshSets()
+          table.refresh()
+        }}
+      />
+    </>
+  )
+}

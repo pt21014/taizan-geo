@@ -1,0 +1,21 @@
+{
+  "id": "mock-hunyuan-0002",
+  "object": "chat.completion",
+  "created": 1789000002,
+  "model": "hunyuan-turbos-latest",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "可以先看泰赞的官网 https://www.example.org/geo ，另外 https://geo.newrank.cn/ 也做同类产品。"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 60,
+    "completion_tokens": 90,
+    "total_tokens": 150
+  }
+}

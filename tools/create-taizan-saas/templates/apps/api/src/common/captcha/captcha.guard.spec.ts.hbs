@@ -1,0 +1,78 @@
+import { Reflector } from '@nestjs/core'
+import { BizException } from '@taizan/nest-core'
+import { describe, expect, it, vi } from 'vitest'
+
+import { CaptchaGuard } from './captcha.guard'
+import { REQUIRE_CAPTCHA_KEY } from './captcha.decorator'
+import type { LuosimaoCaptchaService } from './luosimao-captcha.service'
+
+function fakeContext(declared: boolean, body: Record<string, unknown> = {}): {
+  reflector: Reflector
+  context: Parameters<CaptchaGuard['canActivate']>[0]
+} {
+  const reflector = {
+    getAllAndOverride: vi.fn().mockReturnValue(declared),
+  } as unknown as Reflector
+  const context = {
+    getType: () => 'http',
+    getHandler: () => vi.fn(),
+    getClass: () => vi.fn(),
+    switchToHttp: () => ({ getRequest: () => ({ body }) }),
+  } as unknown as Parameters<CaptchaGuard['canActivate']>[0]
+  return { reflector, context }
+}
+
+function fakeCaptchaService(required: boolean, verifyResult: boolean): LuosimaoCaptchaService {
+  return {
+    required,
+    verify: vi.fn().mockResolvedValue(verifyResult),
+  } as unknown as LuosimaoCaptchaService
+}
+
+describe('CaptchaGuard', () => {
+  it('没有 @RequireCaptcha() 声明时直接放行，不调用 captcha service', async () => {
+    const { reflector, context } = fakeContext(false)
+    const captcha = fakeCaptchaService(true, false)
+    const guard = new CaptchaGuard(reflector, captcha)
+    await expect(guard.canActivate(context)).resolves.toBe(true)
+    expect(captcha.verify).not.toHaveBeenCalled()
+  })
+
+  it('声明了但 LUOSIMAO_CAPTCHA_REQUIRED=false（总开关关）时直接放行', async () => {
+    const { reflector, context } = fakeContext(true)
+    const captcha = fakeCaptchaService(false, false)
+    const guard = new CaptchaGuard(reflector, captcha)
+    await expect(guard.canActivate(context)).resolves.toBe(true)
+    expect(captcha.verify).not.toHaveBeenCalled()
+  })
+
+  it('总开关开、声明了、校验通过时放行', async () => {
+    const { reflector, context } = fakeContext(true, { captchaToken: 'tok' })
+    const captcha = fakeCaptchaService(true, true)
+    const guard = new CaptchaGuard(reflector, captcha)
+    await expect(guard.canActivate(context)).resolves.toBe(true)
+    expect(captcha.verify).toHaveBeenCalledWith('tok')
+  })
+
+  it('总开关开、声明了、校验不通过时抛 BizException', async () => {
+    const { reflector, context } = fakeContext(true, { captchaToken: 'bad' })
+    const captcha = fakeCaptchaService(true, false)
+    const guard = new CaptchaGuard(reflector, captcha)
+    await expect(guard.canActivate(context)).rejects.toThrow(BizException)
+  })
+
+  it('请求体缺 captchaToken 时当空字符串校验（必不通过）', async () => {
+    const { reflector, context } = fakeContext(true, {})
+    const captcha = fakeCaptchaService(true, false)
+    const guard = new CaptchaGuard(reflector, captcha)
+    await expect(guard.canActivate(context)).rejects.toThrow(BizException)
+    expect(captcha.verify).toHaveBeenCalledWith('')
+  })
+})
+
+// 冒烟：metadata key 没被后续重构悄悄改掉。
+describe('REQUIRE_CAPTCHA_KEY', () => {
+  it('是一个带命名空间前缀的字符串', () => {
+    expect(REQUIRE_CAPTCHA_KEY).toBe('{{projectSlug}}:api:require-captcha')
+  })
+})

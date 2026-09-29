@@ -1,0 +1,253 @@
+[
+  {
+    "key": "dashboard",
+    "title": "工作台",
+    "icon": "DashboardOutlined",
+    "path": "/",
+    "componentKey": "Dashboard",
+    "type": "MENU",
+    "side": "ADMIN",
+    "sort": 10
+  },
+  {
+    "key": "staff",
+    "title": "员工",
+    "icon": "TeamOutlined",
+    "path": "/staff",
+    "componentKey": "StaffList",
+    "type": "MENU",
+    "side": "ADMIN",
+    "permission": "staff:list",
+    "sort": 30
+  },
+  {
+    "key": "role",
+    "title": "角色权限",
+    "icon": "SafetyCertificateOutlined",
+    "path": "/roles",
+    "componentKey": "RoleList",
+    "type": "MENU",
+    "side": "ADMIN",
+    "permission": "role:list",
+    "sort": 40
+  },
+  {
+    "key": "billing",
+    "title": "账单与续费",
+    "icon": "CreditCardOutlined",
+    "path": "/billing",
+    "componentKey": "BillingCenter",
+    "type": "MENU",
+    "side": "ADMIN",
+    "sort": 50
+  },
+  {
+    "key": "audit",
+    "title": "操作日志",
+    "icon": "AuditOutlined",
+    "path": "/audit",
+    "componentKey": "AuditList",
+    "type": "MENU",
+    "side": "ADMIN",
+    "permission": "audit:list",
+    "sort": 60
+  },
+  {
+    "key": "announcement",
+    "title": "平台公告",
+    "icon": "NotificationOutlined",
+    "path": "/announcements",
+    "componentKey": "AnnouncementList",
+    "type": "MENU",
+    "side": "ADMIN",
+    "permission": "announcement:list",
+    "sort": 70
+  },
+  {
+    "key": "profile",
+    "title": "个人设置",
+    "icon": "UserOutlined",
+    "path": "/profile",
+    "componentKey": "ProfileSettings",
+    "type": "MENU",
+    "side": "ADMIN",
+    "permission": "profile:read",
+    "sort": 80
+  },
+  {
+    "key": "geo",
+    "title": "GEO 监测",
+    "icon": "RadarChartOutlined",
+    "type": "DIR",
+    "side": "ADMIN",
+    "sort": 15,
+    "children": [
+      {
+        "key": "geo.dashboard",
+        "title": "可见度看板",
+        "path": "/geo",
+        "componentKey": "GeoDashboard",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-dashboard:view",
+        "sort": 5
+      },
+      {
+        "key": "geo.brand",
+        "title": "品牌管理",
+        "path": "/geo/brands",
+        "componentKey": "GeoBrandList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-brand:list",
+        "featureKey": "geo.monitor",
+        "sort": 10
+      },
+      {
+        "key": "geo.brand.create",
+        "title": "新增品牌",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "geo-brand:write",
+        "featureKey": "geo.monitor",
+        "sort": 20
+      },
+      {
+        "key": "geo.prompt",
+        "title": "Prompt 管理",
+        "path": "/geo/prompts",
+        "componentKey": "GeoPromptList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-prompt:list",
+        "featureKey": "geo.monitor",
+        "sort": 30
+      },
+      {
+        "key": "geo.prompt.create",
+        "title": "新增问法",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "geo-prompt:write",
+        "featureKey": "geo.monitor",
+        "sort": 40
+      },
+      {
+        "key": "geo.prompt.generate",
+        "title": "AI 生成问法",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "geo-prompt:generate",
+        "featureKey": "geo.monitor",
+        "sort": 45
+      },
+      {
+        "key": "geo.run",
+        "title": "监测任务",
+        "path": "/geo/runs",
+        "componentKey": "GeoRunList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-run:list",
+        "featureKey": "geo.monitor",
+        "sort": 50
+      },
+      {
+        "key": "geo.run.trigger",
+        "title": "立即刷新",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "geo-run:trigger",
+        "featureKey": "geo.monitor",
+        "sort": 60
+      },
+      {
+        "key": "geo.result",
+        "title": "回答明细",
+        "path": "/geo/results",
+        "componentKey": "GeoResultList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-result:view",
+        "sort": 70
+      },
+      {
+        "key": "geo.citation",
+        "title": "引用来源",
+        "path": "/geo/citations",
+        "componentKey": "GeoCitationList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-citation:view",
+        "sort": 75
+      },
+      {
+        "key": "geo.alert",
+        "title": "告警",
+        "path": "/geo/alerts",
+        "componentKey": "GeoAlertRuleList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-alert:list",
+        "sort": 80
+      },
+      {
+        "key": "geo.alert.write",
+        "title": "新增告警规则",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "geo-alert:write",
+        "featureKey": "geo.monitor",
+        "sort": 85
+      },
+      {
+        "key": "geo.report",
+        "title": "报表",
+        "path": "/geo/reports",
+        "componentKey": "GeoReportList",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "geo-report:view",
+        "sort": 90
+      },
+      {
+        "key": "geo.report.generate",
+        "title": "生成报表",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "geo-report:generate",
+        "sort": 95
+      }
+    ]
+  },
+  {
+    "key": "{{domainSlug}}",
+    "title": "商品",
+    "icon": "ShopOutlined",
+    "type": "DIR",
+    "side": "ADMIN",
+    "sort": 20,
+    "children": [
+      {
+        "key": "{{domainSlug}}.list",
+        "title": "商品列表",
+        "path": "/{{domainSlug}}",
+        "componentKey": "{{DomainPascal}}List",
+        "type": "MENU",
+        "side": "ADMIN",
+        "permission": "{{domainSlug}}:list",
+        "featureKey": "{{domainSlug}}",
+        "sort": 10
+      },
+      {
+        "key": "{{domainSlug}}.create",
+        "title": "新增商品",
+        "type": "BUTTON",
+        "side": "ADMIN",
+        "permission": "{{domainSlug}}:write",
+        "featureKey": "{{domainSlug}}",
+        "sort": 20
+      }
+    ]
+  }
+]

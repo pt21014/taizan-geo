@@ -1,0 +1,110 @@
+import { Drawer, Form, Input } from 'antd'
+import {
+  CrudDrawerForm,
+  CrudTable,
+  dateTimeColumn,
+  enumColumn,
+  useCrudForm,
+  useCrudTable,
+} from '@taizan/admin-ui'
+import type { PageResult } from '@taizan/contracts'
+import {
+  GEO_PROMPT_SOURCE_TEXT,
+  useGeoPromptApi,
+  type GeoPromptSet,
+} from '../../api/geo-prompt'
+
+/** 新建/改名时提交的字段。`source` 是"它怎么来的"，改不了历史，所以表单里没有它。 */
+interface PromptSetInput {
+  name: string
+}
+
+/**
+ * 「Prompt 集」管理抽屉。
+ *
+ * ## 为什么它是一个抽屉而不是一级菜单
+ *
+ * Prompt 集是**问法的容器**，运营一年也不会进来几次（多数店只有一个「默认」集）。
+ * 给它一个一级菜单意味着侧边栏上永远挂着一条几乎没人点的项，而 GEO 后面还有
+ * 六个页面要挂上来。
+ *
+ * ## 删除为什么可能失败
+ *
+ * 后端拒绝删掉还装着问法的集（理由写在 `geo-prompt.service.ts` 的 `removeSet`）。
+ * 这里不预先把「有问法的集」的删除按钮禁掉：列表接口没有返回每个集有多少条问法，
+ * 为了禁一个按钮去多发 N 个请求不值得，而后端的拒绝理由里已经写清了有几条。
+ */
+export function GeoPromptSetDrawer({
+  brandId,
+  open,
+  onClose,
+  onChanged,
+}: {
+  brandId: string
+  open: boolean
+  onClose: () => void
+  /** 集合有增删改之后回调：外层的问法列表筛选项要跟着变 */
+  onChanged: () => void
+}) {
+  const api = useGeoPromptApi()
+
+  const table = useCrudTable<GeoPromptSet>({
+    // 与竞品同理：接口返回数组（一个品牌下的集是个位数），这里包成 `PageResult`。
+    list: async (): Promise<PageResult<GeoPromptSet>> => {
+      if (brandId === '') return { items: [], total: 0, page: 1, pageSize: 10 }
+      const items = await api.listSets(brandId)
+      return { items, total: items.length, page: 1, pageSize: Math.max(items.length, 10) }
+    },
+    remove: async (row) => {
+      await api.removeSet(row.id)
+      onChanged()
+    },
+    rowKey: 'id',
+  })
+
+  const form = useCrudForm<PromptSetInput>({
+    create: (values) => api.createSet({ brandId, name: values.name, source: 'MANUAL' }),
+    update: (id, values) => api.updateSet(id, { name: values.name }),
+    onSuccess: () => {
+      table.refresh()
+      onChanged()
+    },
+  })
+
+  return (
+    <Drawer title="Prompt 集" width={640} open={open} onClose={onClose} destroyOnClose>
+      <CrudTable<GeoPromptSet>
+        table={table}
+        size="small"
+        emptyText="还没有 Prompt 集。新建问法时会自动建一个叫「默认」的。"
+        create={{ label: '新建集', perm: 'geo-prompt:write', onClick: () => form.openForm() }}
+        columns={[
+          { title: '名称', dataIndex: 'name', key: 'name' },
+          enumColumn({ title: '来源', dataIndex: 'source', map: GEO_PROMPT_SOURCE_TEXT }),
+          dateTimeColumn({ title: '创建时间', dataIndex: 'createdAt' }),
+        ]}
+        actions={[
+          {
+            key: 'rename',
+            label: '改名',
+            perm: 'geo-prompt:write',
+            onClick: (row) => form.openWith(row.id, { name: row.name }),
+          },
+          {
+            key: 'del',
+            label: '删除',
+            perm: 'geo-prompt:delete',
+            danger: true,
+            confirm: (row) => `确定删除「${row.name}」？里面还有问法的话会被拒绝。`,
+            onClick: (row) => void table.removeRow(row),
+          },
+        ]}
+      />
+      <CrudDrawerForm form={form} title="Prompt 集" width={420}>
+        <Form.Item name="name" label="名称" rules={[{ required: true, message: '请填名称' }]}>
+          <Input placeholder="如：核心问法" />
+        </Form.Item>
+      </CrudDrawerForm>
+    </Drawer>
+  )
+}

@@ -1,0 +1,180 @@
+/**
+ * 分析用 LLM 的**装配点**（GEO P0 技术设计 §2.2、§4.2 `geo.result.analyze`）。
+ *
+ * 形状照抄同目录上一层的 `engine/geo-engine-registry.provider.ts`：一个工厂函数按 env
+ * 挑一个 `@taizan/llm` 的 provider，包成注入 token `GEO_LLM`。
+ *
+ * ## 为什么包一层 {@link GeoLlm} 而不是直接注入 `LlmProvider`
+ *
+ * `LlmProvider.chat(req, cfg, ctx)` 的三个参数里，后两个（供应商配置、HTTP 客户端）
+ * 对**每一个调用点都是同一份**——它们来自 env 与进程级的 fetch 封装，不来自业务。
+ * 直接注入 `LlmProvider` 的话，两个调用点（分析 handler、问法生成接口）各自要再拼一遍
+ * `cfg`，而那份 cfg 里有 API Key：多一处拼装就多一处把它打进日志的机会。
+ *
+ * 包一层之后调用点只写 `llm.chat(req)`，密钥在这个文件之外不存在。
+ *
+ * ## `hints` 这个参数只有 mock 会读，这是**刻意**的
+ *
+ * `MockLlmProvider` 的行为由每次调用传进去的 `MockLlmConfig` 决定
+ * （`scenario` 选场景，`brandName`/`competitorNames` 决定它编哪些实体）。真实 provider
+ * 的 cfg 里没有这几个字段，传了也会被忽略。
+ *
+ * 另一种做法是加一个 `GEO_LLM_SCENARIO` env——但那样 mock 在一个进程里只能有一个场景，
+ * 而 e2e 恰恰要在同一个进程里既跑「抽提及」（`mention`）又跑「生成问法」（`prompt-gen`）。
+ * 把它做成**每次调用的入参**是唯一能同时满足两者的形状，代价是接口上多一个
+ * 「真实环境用不到」的可选参数，注释里写清楚就好。
+ *
+ * ## 生产环境不许 mock
+ *
+ * 两道防线，与引擎那边同构：
+ * 1. `config/env.ts` 里 `GEO_LLM_PROVIDER` 的 `superRefine`——`NODE_ENV=production`
+ *    配 mock 直接**拒绝启动**；
+ * 2. 本文件的 `assertMockNotInProd`——守的是「有人把那条 refine 删了」。
+ *
+ * mock LLM 的危险性与 mock 引擎同级：它会编出一整套提及/位次/情感，报表上完全看不出假。
+ *
+ * @packageDocumentation
+ */
+
+import { Inject, type Provider } from '@nestjs/common'
+import {
+  assertMockNotInProd,
+  DashScopeLlmProvider,
+  MockLlmProvider,
+  OpenAiCompatibleLlmProvider,
+  type ChatRequest,
+  type ChatResponse,
+  type HttpClient as LlmHttpClient,
+  type LlmProvider,
+  type MockLlmScenario,
+} from '@taizan/llm'
+import { ConfigService } from '@taizan/nest-core'
+
+import type { AppEnv, GeoLlmProviderName } from '../../../config/env'
+import { createEngineHttpClient } from '../engine/http-client'
+
+/**
+ * 注入令牌。
+ *
+ * 用 `Symbol` 而不是字符串，与 `GEO_ENGINE_REGISTRY` 同一个理由：字符串令牌在两个模块
+ * 各写一遍时会静默指向同一个 provider，而 `Symbol` 必须 import，撞不了。
+ */
+export const GEO_LLM = Symbol('GEO_LLM')
+
+/**
+ * 只有 `MockLlmProvider` 会读的调用级提示。真实 provider 收到之后原样丢弃。
+ *
+ * 不是「调试开关」——`scenario` 决定 mock 回 `{ mentions: [...] }` 还是
+ * `{ prompts: [...] }`，两个调用点要的结构化输出根本不是同一个形状。
+ */
+export interface GeoLlmHints {
+  /** mock 的场景名；不传时用 `mention`。 */
+  scenario?: MockLlmScenario
+  /** mock 编提及时用的品牌名。**必须是回答正文里真的出现过的那个词**，否则 mock 回空数组。 */
+  brandName?: string
+  /** mock 编提及时用的竞品名。 */
+  competitorNames?: string[]
+}
+
+/** 调用点看到的 LLM 门面：一个方法，没有密钥，没有 HTTP 客户端。 */
+export interface GeoLlm {
+  /** 生效的供应商名（`mock` / `openai-compatible` / `dashscope`），只用于日志与诊断。 */
+  readonly providerName: GeoLlmProviderName
+  /**
+   * 发一次对话。
+   *
+   * @param req - 请求体；带 `jsonSchema` 就表示要结构化输出，
+   *   响应的 `json` 字段是 `parseJsonLoose(text)` 的结果（**解析失败时是 `undefined`，不抛错**）
+   * @param hints - 见 {@link GeoLlmHints}，只有 mock 会读
+   */
+  chat(req: ChatRequest, hints?: GeoLlmHints): Promise<ChatResponse>
+}
+
+/** 缺必填配置时抛它。装配期抛，不等到第一次调用。 */
+export class GeoLlmConfigError extends Error {
+  override readonly name = 'GeoLlmConfigError'
+}
+
+function requireEnv(value: string | undefined, key: string, provider: string): string {
+  const v = value?.trim() ?? ''
+  if (v === '') {
+    throw new GeoLlmConfigError(
+      `[{{scope}}/api] GEO_LLM_PROVIDER=${provider} 需要 ${key}，但它是空的。` +
+        '缺配置在启动时就该炸——留到跑批时才发现的话，那一批查询已经花掉真金白银了。',
+    )
+  }
+  return v
+}
+
+/**
+ * 按 env 造一个 {@link GeoLlm}。
+ *
+ * 导出成普通函数（而不是只有 provider）是为了让 spec 能直接用它，不必起 Nest 容器。
+ *
+ * @param config - 已校验的 env
+ * @param http - HTTP 客户端；默认复用引擎那边的 `createEngineHttpClient()`
+ *   （两个包各自声明了结构相同的 `HttpClient`，是刻意的，见那个文件的文件头；
+ *   结构兼容，同一个实现可以喂给两边）
+ * @param env - 判定「是不是生产」用，一般传 `process.env`
+ */
+export function createGeoLlm(
+  config: ConfigService<AppEnv>,
+  http: LlmHttpClient = createEngineHttpClient(),
+  env: { NODE_ENV?: string } = process.env,
+): GeoLlm {
+  const providerName = config.get('GEO_LLM_PROVIDER')
+
+  // 第二道防线：守的是「有人把 env schema 里那条 superRefine 删了」。
+  assertMockNotInProd(env, providerName === 'mock' ? ['mock'] : [])
+
+  const model = config.get('GEO_LLM_MODEL')
+  const apiKey = config.get('GEO_LLM_API_KEY')
+  const baseUrl = config.get('GEO_LLM_BASE_URL')
+
+  let provider: LlmProvider<unknown>
+  let cfg: unknown
+
+  if (providerName === 'openai-compatible') {
+    provider = new OpenAiCompatibleLlmProvider() as LlmProvider<unknown>
+    cfg = {
+      baseUrl: requireEnv(baseUrl, 'GEO_LLM_BASE_URL', providerName),
+      apiKey: requireEnv(apiKey, 'GEO_LLM_API_KEY', providerName),
+      model: requireEnv(model, 'GEO_LLM_MODEL', providerName),
+    }
+  } else if (providerName === 'dashscope') {
+    provider = new DashScopeLlmProvider() as LlmProvider<unknown>
+    cfg = {
+      apiKey: requireEnv(apiKey, 'GEO_LLM_API_KEY', providerName),
+      model: requireEnv(model, 'GEO_LLM_MODEL', providerName),
+      // DashScope 的 baseUrl 是可选的（包里有官方默认值），所以这里不 require。
+      ...(baseUrl?.trim() ? { baseUrl: baseUrl.trim() } : {}),
+    }
+  } else {
+    provider = new MockLlmProvider() as unknown as LlmProvider<unknown>
+    cfg = {}
+  }
+
+  return {
+    providerName,
+    async chat(req: ChatRequest, hints: GeoLlmHints = {}): Promise<ChatResponse> {
+      // mock 的 cfg 就是 hints 本身；真实 provider 的 cfg 里没有这几个键，
+      // 所以只在 mock 分支合并——合进去也不会出事，但那会让「谁读了什么」看不清。
+      const effective = providerName === 'mock' ? { ...(cfg as object), ...hints } : cfg
+      return provider.chat(req, effective, { http })
+    },
+  }
+}
+
+/**
+ * Nest provider。`GeoModule` 的 `providers` 里挂上它，注入点写
+ * `@Inject(GEO_LLM) private readonly llm: GeoLlm`。
+ */
+export const geoLlmProvider: Provider = {
+  provide: GEO_LLM,
+  // 显式 `inject`：没有 `emitDecoratorMetadata`，工厂的参数类型推不出来（见 tsup.config.ts 文件头）。
+  inject: [ConfigService],
+  useFactory: (config: ConfigService<AppEnv>): GeoLlm => createGeoLlm(config),
+}
+
+/** 给注入点用的装饰器别名，省得每处都写一遍 `@Inject(GEO_LLM)`。 */
+export const InjectGeoLlm = (): ParameterDecorator => Inject(GEO_LLM)

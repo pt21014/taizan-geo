@@ -1,0 +1,20 @@
+/**
+ * `@RequireCaptcha()`：挂在容易被脚本刷的 `@Public()` 接口上，declares 请求体要带
+ * `captchaToken`（螺丝帽人机验证结果）。
+ *
+ * 形状照抄 `@taizan/nest-auth` 的 `RateLimited`/`Public`：本文件只写 metadata，
+ * 判定在 `CaptchaGuard`（拆开的理由与那两个装饰器一致——声明与执行分层）。
+ *
+ * @packageDocumentation
+ */
+import { SetMetadata } from '@nestjs/common'
+
+/** metadata key，带应用前缀避免撞车（同 `@taizan/nest-auth` 的 `{{projectSlug}}:auth:*` 约定）。 */
+export const REQUIRE_CAPTCHA_KEY = '{{projectSlug}}:api:require-captcha'
+
+/**
+ * 声明这个路由需要人机验证。实际是否校验还受 `LUOSIMAO_CAPTCHA_REQUIRED` 开关控制——
+ * 开关关着时 `CaptchaGuard` 直接放行，方便本地联调/前端还没接验证码组件时不挡登录。
+ */
+export const RequireCaptcha = (): MethodDecorator & ClassDecorator =>
+  SetMetadata(REQUIRE_CAPTCHA_KEY, true)

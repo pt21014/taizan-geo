@@ -1,0 +1,261 @@
+/**
+ * Prompt 的**业务规则纯函数**（GEO P0 技术设计 §4.4）。
+ *
+ * 这里最要紧的是 {@link hashPromptText}：它定义了「两条问法算不算同一条」的口径，
+ * 而 `GeoPrompt.textHash` 是一个**落库的唯一索引列**。改了这个函数就等于改了去重口径，
+ * 存量行必须同步重算——所以它的归一化步骤写死在这一处，不许在别处复制一份。
+ *
+ * **不要往这里 import 任何 `@nestjs/*` 或 `@prisma/client`**。
+ * `node:crypto` 是例外：它是 Node 标准库，不带框架，也不影响可测性。
+ *
+ * @packageDocumentation
+ */
+
+import { createHash } from 'node:crypto'
+
+/** 漏斗阶段（与 `prisma/schema/10-business/20-geo.prisma` 的 `GeoFunnelStage` 一一对应）。 */
+export type GeoFunnelStageLike = 'TOFU' | 'MOFU' | 'BOFU' | 'UNKNOWN'
+
+/** 合法漏斗阶段全集，供 DTO 校验与本文件共用。 */
+export const GEO_FUNNEL_STAGES: readonly GeoFunnelStageLike[] = ['TOFU', 'MOFU', 'BOFU', 'UNKNOWN']
+
+/** Prompt 集来源（与 `GeoPromptSource` 一一对应）。 */
+export type GeoPromptSourceLike = 'MANUAL' | 'AI_GEN' | 'IMPORT'
+
+/** 合法来源全集。 */
+export const GEO_PROMPT_SOURCES: readonly GeoPromptSourceLike[] = ['MANUAL', 'AI_GEN', 'IMPORT']
+
+/** 问法正文最短长度。一个字的"问法"问不出任何东西，只会白烧一次查询配额。 */
+export const GEO_PROMPT_TEXT_MIN = 2
+
+/** 问法正文最长长度。列是 `@db.Text`，这个上限挡的是"把整篇文章粘进来"。 */
+export const GEO_PROMPT_TEXT_MAX = 500
+
+/** 主题标签最大长度。 */
+export const GEO_PROMPT_TOPIC_MAX = 60
+
+/** Prompt 集名称最大长度。 */
+export const GEO_PROMPT_SET_NAME_MAX = 60
+
+/** 优先级取值范围。配额不够时优先跑高优先级的，范围定死才好在前端做成滑杆。 */
+export const GEO_PROMPT_PRIORITY_MIN = 0
+export const GEO_PROMPT_PRIORITY_MAX = 100
+
+/** 一次批量导入的条数上限。再多就该走后台任务，而不是一个同步 HTTP 请求。 */
+export const GEO_PROMPT_IMPORT_MAX = 200
+
+/**
+ * 没有指定 Prompt 集时自动归入的那一个的名字。
+ *
+ * 常量而不是字面量：service 里「找不到就建一个」用的是同一个名字，
+ * 两处各写一份的话，某天改了一处就会每次都新建一个「默认」。
+ */
+export const DEFAULT_PROMPT_SET_NAME = '默认'
+
+/** 一条校验结论。 */
+export interface RuleViolation {
+  field: string
+  message: string
+}
+
+/** 校验入参。 */
+export interface GeoPromptInput {
+  text?: unknown
+  topic?: unknown
+  funnelStage?: unknown
+  isTracked?: unknown
+  priority?: unknown
+}
+
+/**
+ * 问法正文的归一化：trim + 把连续空白（含换行、全角空格）压成一个半角空格 + 转小写。
+ *
+ * 这是 {@link hashPromptText} 的前半段，单独导出是为了让调用方能**看到**去重看的是什么。
+ * 三步的理由各不相同：
+ * - trim / 压空白：从表格里粘出来的问法常带尾随空格与换行，人眼看不出来；
+ * - 转小写：`"Taizan 怎么样"` 与 `"{{projectSlug}} 怎么样"` 问出来的是同一批回答。
+ *
+ * **刻意不做的**：不删标点。`"太赞好用吗"` 与 `"太赞好用吗？"` 在生成式引擎那里
+ * 确实可能得到不同的回答，合并它们会让运营丢掉一个真实的观测点。
+ */
+export function normalizePromptText(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  return raw.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+/**
+ * 问法正文的去重指纹：`sha256(normalizePromptText(text))` 的十六进制（64 字符）。
+ *
+ * 落在 `GeoPrompt.textHash @db.VarChar(64)` 上，与 `@@unique([tenantId, brandId, textHash,
+ * deletedAt])` 一起构成「同一个品牌下同一条问法只存一份」。
+ *
+ * 用 hash 而不是直接给 `text` 加唯一索引：`text` 是 `@db.Text`，MySQL 的索引长度
+ * 放不下一条 500 字的问法。
+ */
+export function hashPromptText(raw: unknown): string {
+  return createHash('sha256').update(normalizePromptText(raw), 'utf8').digest('hex')
+}
+
+/** {@link dedupePrompts} 的一条产出。 */
+export interface DedupedPrompt {
+  /** 原始正文（**未**小写化——展示给人看的还是他自己写的那一条）。 */
+  text: string
+  /** 去重指纹。 */
+  textHash: string
+}
+
+/**
+ * 批量正文去重：按 {@link hashPromptText} 归并，保留**首次出现**的原始写法，
+ * 顺带丢掉空串与非字符串项。
+ *
+ * @param texts - 原始正文数组（导入框里一行一条）
+ * @param existingHashes - 已经在库里的指纹集合；命中的会被算成 skipped
+ * @returns `kept` = 该写库的；`skipped` = 被去掉的条数（库里已有 + 输入里重复 + 空行）
+ */
+export function dedupePrompts(
+  texts: readonly unknown[],
+  // process-local: 这是一个**函数参数的默认值**，每次调用现造、调用结束即回收，
+  // 不是长驻状态——spec 12 的规则 4 是个按缩进猜的启发式，这里是它的误报。
+  // 真正的去重真源是库里的 `GeoPrompt.textHash` 唯一索引，进程之间本来就不共享内存。
+  existingHashes: ReadonlySet<string> = new Set(),
+): { kept: DedupedPrompt[]; skipped: number } {
+  const kept: DedupedPrompt[] = []
+  const seen = new Set<string>()
+  let skipped = 0
+
+  for (const raw of texts) {
+    if (typeof raw !== 'string') {
+      skipped += 1
+      continue
+    }
+    const text = raw.trim()
+    if (text === '') {
+      // 空行是粘贴多行文本的常态，不算"被跳过的一条"——把它计进 skipped
+      // 会让「导入 10 条，跳过 3 条」里的 3 包含 2 个空行，运营会去找那不存在的两条重复。
+      continue
+    }
+    const textHash = hashPromptText(text)
+    if (seen.has(textHash) || existingHashes.has(textHash)) {
+      skipped += 1
+      continue
+    }
+    seen.add(textHash)
+    kept.push({ text, textHash })
+  }
+
+  return { kept, skipped }
+}
+
+/**
+ * 漏斗阶段归一：大小写不敏感，认不出来的一律 `UNKNOWN`。
+ *
+ * 不认识的值**不抛错**：这个字段的来源有导入、AI 生成、以后还有第三方同步，
+ * 一条分不清阶段的 Prompt 照样是一条有效的 Prompt。把它判成 `UNKNOWN` 之后
+ * 报表里会单独成一组，运营看得见、可以回来补——而抛错只会让整批导入失败。
+ */
+export function normalizeFunnelStage(raw: unknown): GeoFunnelStageLike {
+  if (typeof raw !== 'string') return 'UNKNOWN'
+  const value = raw.trim().toUpperCase()
+  return GEO_FUNNEL_STAGES.includes(value as GeoFunnelStageLike)
+    ? (value as GeoFunnelStageLike)
+    : 'UNKNOWN'
+}
+
+/** 新建一条 Prompt 时的完整校验。 */
+export function validatePromptInput(input: GeoPromptInput): RuleViolation[] {
+  const violations: RuleViolation[] = []
+  violations.push(...checkText(input.text, true))
+  violations.push(...checkTopic(input.topic))
+  violations.push(...checkIsTracked(input.isTracked))
+  violations.push(...checkPriority(input.priority))
+  // `funnelStage` 不校验：{@link normalizeFunnelStage} 永远给得出一个合法值。
+  return violations
+}
+
+/** 修改时的校验：**只校验给了的字段**。 */
+export function validatePromptPatch(patch: GeoPromptInput): RuleViolation[] {
+  const violations: RuleViolation[] = []
+  if (patch.text !== undefined) violations.push(...checkText(patch.text, false))
+  if (patch.topic !== undefined) violations.push(...checkTopic(patch.topic))
+  if (patch.isTracked !== undefined) violations.push(...checkIsTracked(patch.isTracked))
+  if (patch.priority !== undefined) violations.push(...checkPriority(patch.priority))
+  return violations
+}
+
+/** Prompt 集名称归一（与品牌名同一套：trim + 压空白）。 */
+export function normalizePromptSetName(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  return raw.trim().replace(/\s+/g, ' ')
+}
+
+/** Prompt 集的校验。 */
+export function validatePromptSetInput(input: { name?: unknown; source?: unknown }): RuleViolation[] {
+  const violations: RuleViolation[] = []
+  const name = normalizePromptSetName(input.name)
+  if (name === '') {
+    violations.push({ field: 'name', message: 'Prompt 集名称不能为空' })
+  } else if ([...name].length > GEO_PROMPT_SET_NAME_MAX) {
+    violations.push({
+      field: 'name',
+      message: `Prompt 集名称不能超过 ${GEO_PROMPT_SET_NAME_MAX} 个字`,
+    })
+  }
+  if (input.source !== undefined && input.source !== null) {
+    if (!GEO_PROMPT_SOURCES.includes(input.source as GeoPromptSourceLike)) {
+      violations.push({ field: 'source', message: `来源只能是 ${GEO_PROMPT_SOURCES.join(' / ')}` })
+    }
+  }
+  return violations
+}
+
+function checkText(value: unknown, required: boolean): RuleViolation[] {
+  if (value === undefined || value === null) {
+    return required ? [{ field: 'text', message: '问法正文必填' }] : []
+  }
+  if (typeof value !== 'string') {
+    return [{ field: 'text', message: '问法正文必须是字符串' }]
+  }
+  const text = value.trim()
+  if ([...text].length < GEO_PROMPT_TEXT_MIN) {
+    return [{ field: 'text', message: `问法正文至少 ${GEO_PROMPT_TEXT_MIN} 个字` }]
+  }
+  if ([...text].length > GEO_PROMPT_TEXT_MAX) {
+    return [{ field: 'text', message: `问法正文不能超过 ${GEO_PROMPT_TEXT_MAX} 个字` }]
+  }
+  return []
+}
+
+function checkTopic(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null || value === '') return []
+  if (typeof value !== 'string') {
+    return [{ field: 'topic', message: '主题必须是字符串' }]
+  }
+  if ([...value].length > GEO_PROMPT_TOPIC_MAX) {
+    return [{ field: 'topic', message: `主题不能超过 ${GEO_PROMPT_TOPIC_MAX} 个字` }]
+  }
+  return []
+}
+
+function checkIsTracked(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null) return []
+  if (typeof value !== 'boolean') {
+    return [{ field: 'isTracked', message: '是否追踪必须是布尔值' }]
+  }
+  return []
+}
+
+function checkPriority(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null) return []
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    return [{ field: 'priority', message: '优先级必须是整数' }]
+  }
+  if (value < GEO_PROMPT_PRIORITY_MIN || value > GEO_PROMPT_PRIORITY_MAX) {
+    return [
+      {
+        field: 'priority',
+        message: `优先级只能在 ${GEO_PROMPT_PRIORITY_MIN}–${GEO_PROMPT_PRIORITY_MAX} 之间`,
+      },
+    ]
+  }
+  return []
+}

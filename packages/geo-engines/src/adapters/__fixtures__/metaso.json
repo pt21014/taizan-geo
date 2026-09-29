@@ -1,0 +1,31 @@
+{
+  "credits": 1,
+  "total": 2,
+  "searchParameters": {
+    "q": "国内做 GEO 监测的工具有哪些？",
+    "scope": "webpage",
+    "size": "10",
+    "includeSummary": true,
+    "includeRawContent": false,
+    "conciseSnippet": false
+  },
+  "summary": "国内做 GEO 监测的工具有泰赞GEO、新榜智汇等，其中泰赞GEO 覆盖六个国产引擎。",
+  "webpages": [
+    {
+      "title": "泰赞 GEO",
+      "link": "https://www.example.org/geo?utm_campaign=metaso",
+      "snippet": "生成式引擎优化监测平台。",
+      "date": "2026-08-01",
+      "score": 0.93,
+      "content": ""
+    },
+    {
+      "title": "新榜智汇",
+      "link": "https://geo.newrank.cn/",
+      "snippet": "新榜出品的 GEO 监测产品。",
+      "date": "2026-07-20",
+      "score": 0.81,
+      "content": ""
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// GEO 平台域表 —— 2 张，**没有 tenantId**。对应《GEO-P0技术设计.md》§3.2。
+//
+// 为什么引擎与来源归类规则是平台域而不是租户域：
+//   · 引擎密钥是平台自己的商务合同（一套 key 服务所有租户），租户既不该看见也不该配；
+//   · 计价、限速、超时是平台的成本与稳定性参数，让租户改等于让租户改自己的账单；
+//   · 来源归类规则（zhihu → SOCIAL）是全平台共识，每个租户维护一份只会各不相同。
+//
+// 平台域 = 不在 `src/tenancy/tenant-models.ts` 的隔离名单里 = 业务代码**不能**用
+// `prisma.tenant.geoEngine`，只能走 `RawPrismaService` 并在 `src/tenancy/raw-reasons.ts`
+// 登记理由 + 就地写 `// raw-reason:`。这两张表刻意不带任何 `tenantId` 列：
+// 一旦带了，隔离校验器就会要求它进名单，而进了名单的表在平台后台是读不出来的。
+//
+// 租户侧"这个租户启用了哪些引擎"不在这里，而是 `GeoBrand.engineCodes`（快照字符串数组）
+// 加 `QuotaKind.GEO_ENGINE` 配额闸门。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 一个生成式引擎接入点。【平台域】
+/// `credentialEnc` 是**整包 credentials 的 JSON 密文**（不同引擎需要的字段不一样，
+/// 拆成列等于每接一个引擎改一次表）。解密后 JSON.parse 直接喂 EngineAdapter.ask()。
+/// 密文列与 `credentialKeyId` 必须成对，登记在 `src/registry/encrypted-columns.ts`，
+/// 由 `test/arch/encrypted-columns.spec.ts` 与 `test/arch/index.spec.ts` 的 spec 11 对账。
+model GeoEngine {
+  id                     String        @id @db.VarChar(26)
+  /// 稳定标识，代码与 GeoBrand.engineCodes / GeoQueryResult.engineCode 都按 code 引用，
+  /// 不按 id——引擎行被删重建之后，历史数据仍然要读得懂。
+  code                   String        @unique @db.VarChar(64)
+  name                   String
+  /// 厂商标识（openai / doubao / kimi / perplexity …）。
+  vendor                 String        @db.VarChar(64)
+  accessType             GeoAccessType @default(API)
+  enabled                Boolean       @default(true)
+  /// 默认模型名，落到 GeoQueryResult.model 做快照。
+  model                  String        @default("") @db.VarChar(128)
+  /// API 基址（自建网关/代理时覆盖）。
+  baseUrl                String?       @db.VarChar(500)
+  /// 整包 credentials 的 JSON 密文。**明文永远不落库**，接口只回 credentialMasked。
+  credentialEnc          String?       @db.Text
+  /// 加密时使用的密钥版本号；没有它，轮换到一半的行分不清新旧密钥。
+  credentialKeyId        String?
+  /// 给平台运营看的脱敏提示，例如 `sk-****abcd`。
+  credentialMasked       String?
+  /// 按次计价部分（分/次）。BROWSER 类引擎通常只有这一项。
+  pricePerQueryCents     Int           @default(0)
+  /// 输入 token 单价（分 / 每百万 token）。用"每百万"是为了让单价在整数域里还有精度。
+  priceInPerMTokenCents  Int           @default(0)
+  /// 输出 token 单价（分 / 每百万 token）。
+  priceOutPerMTokenCents Int           @default(0)
+  /// 平台侧限速（次/分钟），跑批调度按它排队。
+  rateLimitPerMin        Int           @default(60)
+  timeoutMs              Int           @default(60000)
+  /// 适配器的额外参数（temperature、是否联网、region…）。
+  config                 Json
+  sort                   Int           @default(0)
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+
+  @@index([enabled, sort])
+}
+
+/// 引用来源 → 平台标识 + 归类的规则表。【平台域】
+/// 匹配发生在 GeoCitation 落库时，结果冗余进那张表的 platform / category 列：
+/// 规则事后改了，历史行不会自动变——这是刻意的，否则昨天的报表今天会自己改口径。
+model GeoSourcePlatformRule {
+  id        String            @id @db.VarChar(26)
+  /// 域名匹配式，支持 `zhihu.com` 与 `*.zhihu.com` 两种写法。全局唯一，
+  /// 同一个式子只允许有一条规则（两条互相矛盾的规则谁赢取决于扫描顺序）。
+  pattern   String            @db.VarChar(255)
+  /// 命中后写进 GeoCitation.platform 的标识，例如 `zhihu`。
+  platform  String            @db.VarChar(64)
+  category  GeoSourceCategory
+  /// 匹配优先级，大的先匹配。精确域名应当高于通配式。
+  priority  Int               @default(0)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@unique([pattern])
+  @@index([priority])
+}
+
+/// 引擎接入方式。BROWSER 类（浏览器自动化）成本与稳定性都和 API 类不同，
+/// 调度与重试策略要分开，所以它是一个字段而不是靠 vendor 猜。
+enum GeoAccessType {
+  /// 官方 API。
+  API
+  /// 浏览器自动化抓取。
+  BROWSER
+}

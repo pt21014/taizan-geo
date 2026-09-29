@@ -1,0 +1,71 @@
+{
+  "id": "resp_02178849073345588e7400000000",
+  "object": "response",
+  "model": "doubao-seed-2-1-pro-260628",
+  "status": "completed",
+  "output": [
+    {
+      "id": "rs_02178849073770400000",
+      "type": "reasoning",
+      "status": "completed",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "用户要找国内的 GEO 监测工具，先搜一下。"
+        }
+      ]
+    },
+    {
+      "id": "ws_02178849074154500000",
+      "type": "web_search_call",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "国内 GEO 监测工具",
+        "queries": ["国内 GEO 监测工具"]
+      }
+    },
+    {
+      "id": "msg_02178849076046900000",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "GEO 监测工具里比较常见的是泰赞GEO 和新榜智汇。",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "title": "泰赞 GEO",
+              "url": "https://www.example.org/geo?utm_source=doubao",
+              "site_name": "泰赞",
+              "publish_time": "2026-08-01T10:24:00+08:00",
+              "summary": "支持六个国产引擎的可见度监测。"
+            },
+            {
+              "type": "url_citation",
+              "title": "新榜智汇",
+              "url": "https://geo.newrank.cn/",
+              "site_name": "新榜",
+              "publish_time": "2026-07-20T09:00:00+08:00"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 3666,
+    "output_tokens": 1610,
+    "total_tokens": 5276,
+    "tool_usage": {
+      "web_search": 1
+    },
+    "tool_usage_details": {
+      "web_search": {
+        "search_engine": 1
+      }
+    }
+  }
+}

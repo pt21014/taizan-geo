@@ -1,0 +1,224 @@
+/**
+ * `geo-brand.rules.ts` 的单测。
+ *
+ * 只测纯函数：不起 Nest、不连库、不读时钟。这里覆盖的每一条都是运营真的会打进来的输入
+ * （从浏览器地址栏整条粘过来的域名、复制两遍的别名、手滑填成 0 的采样次数）。
+ *
+ * @packageDocumentation
+ */
+
+import { describe, expect, it } from 'vitest'
+
+import {
+  assertCompetitorLimit,
+  GEO_BRAND_ALIAS_MAX,
+  GEO_BRAND_NAME_MAX,
+  MAX_COMPETITORS,
+  normalizeAliases,
+  normalizeBrandName,
+  normalizeDomain,
+  normalizeEngineCodes,
+  validateBrandInput,
+  validateBrandPatch,
+} from './geo-brand.rules'
+
+describe('normalizeBrandName', () => {
+  it('去首尾空白', () => {
+    expect(normalizeBrandName('  太赞  ')).toBe('太赞')
+  })
+
+  it('把连续空白压成一个（否则重名检查会被多打的空格绕过去）', () => {
+    expect(normalizeBrandName('太赞   科技')).toBe('太赞 科技')
+    expect(normalizeBrandName('太赞\t\n科技')).toBe('太赞 科技')
+  })
+
+  it('非字符串一律归零', () => {
+    expect(normalizeBrandName(undefined)).toBe('')
+    expect(normalizeBrandName(null)).toBe('')
+    expect(normalizeBrandName(123)).toBe('')
+  })
+})
+
+describe('normalizeDomain', () => {
+  it('削掉协议', () => {
+    expect(normalizeDomain('https://example.org')).toBe('example.org')
+    expect(normalizeDomain('http://example.org')).toBe('example.org')
+    expect(normalizeDomain('//example.org')).toBe('example.org')
+  })
+
+  it('削掉 www. 前缀（只削一层）', () => {
+    expect(normalizeDomain('www.example.org')).toBe('example.org')
+    expect(normalizeDomain('https://www.example.org')).toBe('example.org')
+    // 两层 www 是个错的输入，不该被悄悄"修好"。
+    expect(normalizeDomain('www.www.example.org')).toBe('www.example.org')
+  })
+
+  it('削掉路径、query、hash 与末尾斜杠', () => {
+    expect(normalizeDomain('https://www.example.org/')).toBe('example.org')
+    expect(normalizeDomain('https://example.org/pricing?from=ad#top')).toBe('example.org')
+  })
+
+  it('削掉端口与认证信息', () => {
+    expect(normalizeDomain('https://example.org:8443/x')).toBe('example.org')
+    expect(normalizeDomain('https://user:pass@example.org/x')).toBe('example.org')
+  })
+
+  it('转小写、削掉 FQDN 的末尾点', () => {
+    expect(normalizeDomain('HTTPS://WWW.Example.ORG.')).toBe('example.org')
+  })
+
+  it('保留子域（`shop.example.org` 与 `example.org` 是两个阵地）', () => {
+    expect(normalizeDomain('https://shop.example.org/a/b')).toBe('shop.example.org')
+  })
+
+  it('空值/非字符串 → null（品牌可以没有官网）', () => {
+    expect(normalizeDomain('')).toBeNull()
+    expect(normalizeDomain('   ')).toBeNull()
+    expect(normalizeDomain(undefined)).toBeNull()
+    expect(normalizeDomain(null)).toBeNull()
+    expect(normalizeDomain(42)).toBeNull()
+    expect(normalizeDomain('https://')).toBeNull()
+  })
+})
+
+describe('normalizeAliases', () => {
+  it('逐条 trim、压内部空白、丢空串', () => {
+    expect(normalizeAliases([' 太赞 ', '', '   ', 'tai  zan'])).toEqual(['太赞', 'tai zan'])
+  })
+
+  it('大小写不敏感去重，保留首次出现的写法', () => {
+    expect(normalizeAliases(['Taizan', '{{projectSlug}}', 'TAIZAN'])).toEqual(['Taizan'])
+  })
+
+  it('丢掉非字符串项', () => {
+    expect(normalizeAliases(['太赞', 1, null, {}, '赞'])).toEqual(['太赞', '赞'])
+  })
+
+  it('非数组一律当空数组', () => {
+    expect(normalizeAliases(undefined)).toEqual([])
+    expect(normalizeAliases('太赞')).toEqual([])
+  })
+})
+
+describe('normalizeEngineCodes', () => {
+  it('转小写、trim、去重、保序', () => {
+    expect(normalizeEngineCodes([' Qwen ', 'QWEN', 'ernie'])).toEqual(['qwen', 'ernie'])
+  })
+
+  it('丢掉空串与非字符串', () => {
+    expect(normalizeEngineCodes(['', '  ', 5, 'mock'])).toEqual(['mock'])
+  })
+})
+
+describe('validateBrandInput', () => {
+  const ok = {
+    name: '太赞',
+    domain: 'https://www.example.org/',
+    aliases: ['{{projectSlug}}'],
+    industry: 'SaaS',
+    locale: 'zh-CN',
+    status: 'ACTIVE',
+    refreshFreq: 'WEEKLY',
+    sampleSize: 3,
+    engineCodes: ['mock'],
+  }
+
+  it('一条合法输入零违规', () => {
+    expect(validateBrandInput(ok)).toEqual([])
+  })
+
+  it('名字必填', () => {
+    expect(validateBrandInput({ ...ok, name: '   ' }).map((v) => v.field)).toEqual(['name'])
+    expect(validateBrandInput({ ...ok, name: undefined }).map((v) => v.field)).toEqual(['name'])
+  })
+
+  it('名字超长被拦（按字符数，不是字节）', () => {
+    const long = '赞'.repeat(GEO_BRAND_NAME_MAX + 1)
+    expect(validateBrandInput({ ...ok, name: long }).map((v) => v.field)).toEqual(['name'])
+    expect(validateBrandInput({ ...ok, name: '赞'.repeat(GEO_BRAND_NAME_MAX) })).toEqual([])
+  })
+
+  it('域名形状不对被拦，但空域名放行', () => {
+    expect(validateBrandInput({ ...ok, domain: '不是域名' }).map((v) => v.field)).toEqual(['domain'])
+    expect(validateBrandInput({ ...ok, domain: '' })).toEqual([])
+    expect(validateBrandInput({ ...ok, domain: undefined })).toEqual([])
+  })
+
+  it('别名条数超限被拦', () => {
+    const many = Array.from({ length: GEO_BRAND_ALIAS_MAX + 1 }, (_, i) => `别名${i}`)
+    expect(validateBrandInput({ ...ok, aliases: many }).map((v) => v.field)).toEqual(['aliases'])
+  })
+
+  it('采样次数越界被拦（0 与 11 都不行）', () => {
+    expect(validateBrandInput({ ...ok, sampleSize: 0 }).map((v) => v.field)).toEqual(['sampleSize'])
+    expect(validateBrandInput({ ...ok, sampleSize: 11 }).map((v) => v.field)).toEqual(['sampleSize'])
+    expect(validateBrandInput({ ...ok, sampleSize: 1 })).toEqual([])
+    expect(validateBrandInput({ ...ok, sampleSize: 10 })).toEqual([])
+  })
+
+  it('采样次数不是整数被拦', () => {
+    expect(validateBrandInput({ ...ok, sampleSize: 3.5 }).map((v) => v.field)).toEqual([
+      'sampleSize',
+    ])
+  })
+
+  it('状态 / 刷新频率只认枚举字面量', () => {
+    expect(validateBrandInput({ ...ok, status: 'ARCHIVED' }).map((v) => v.field)).toEqual(['status'])
+    expect(validateBrandInput({ ...ok, refreshFreq: 'HOURLY' }).map((v) => v.field)).toEqual([
+      'refreshFreq',
+    ])
+  })
+
+  it('locale 形状不对被拦', () => {
+    expect(validateBrandInput({ ...ok, locale: '中文' }).map((v) => v.field)).toEqual(['locale'])
+    expect(validateBrandInput({ ...ok, locale: 'zh-Hant-TW' })).toEqual([])
+  })
+
+  it('引擎 code 含非法字符被拦', () => {
+    expect(validateBrandInput({ ...ok, engineCodes: ['qwen!'] }).map((v) => v.field)).toEqual([
+      'engineCodes',
+    ])
+  })
+})
+
+describe('validateBrandPatch', () => {
+  it('空 patch 零违规（只校验给了的字段）', () => {
+    expect(validateBrandPatch({})).toEqual([])
+  })
+
+  it('给了就校验', () => {
+    expect(validateBrandPatch({ name: '  ' }).map((v) => v.field)).toEqual(['name'])
+    expect(validateBrandPatch({ sampleSize: 99 }).map((v) => v.field)).toEqual(['sampleSize'])
+  })
+
+  it('显式传 null 的枚举字段被拦（patch 语义里 null 不是"不改"）', () => {
+    expect(validateBrandPatch({ status: null }).map((v) => v.field)).toEqual(['status'])
+  })
+})
+
+describe('assertCompetitorLimit', () => {
+  it(`未到上限放行（上限 ${MAX_COMPETITORS}）`, () => {
+    expect(assertCompetitorLimit(0)).toEqual([])
+    expect(assertCompetitorLimit(MAX_COMPETITORS - 1)).toEqual([])
+  })
+
+  it('正好到上限时再加一条被拦', () => {
+    expect(assertCompetitorLimit(MAX_COMPETITORS).map((v) => v.field)).toEqual(['competitors'])
+  })
+
+  it('adding=0（改一条已有的）在满员时也放行', () => {
+    expect(assertCompetitorLimit(MAX_COMPETITORS, 0)).toEqual([])
+  })
+
+  it('批量加时按总数判', () => {
+    expect(assertCompetitorLimit(MAX_COMPETITORS - 2, 2)).toEqual([])
+    expect(assertCompetitorLimit(MAX_COMPETITORS - 2, 3).map((v) => v.field)).toEqual([
+      'competitors',
+    ])
+  })
+
+  it('非法计数被拦（不是静默放行）', () => {
+    expect(assertCompetitorLimit(-1).map((v) => v.field)).toEqual(['competitors'])
+    expect(assertCompetitorLimit(1.5).map((v) => v.field)).toEqual(['competitors'])
+  })
+})

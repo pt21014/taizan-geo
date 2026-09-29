@@ -1,0 +1,194 @@
+import { Alert, Button, Drawer, Form, InputNumber, Select, Space, Table, Tag, message } from 'antd'
+import {
+  GEO_FUNNEL_STAGE_OPTIONS,
+  GEO_FUNNEL_STAGE_TEXT,
+  useGeoPromptApi,
+  type GeoPromptCandidate,
+  type GeoPromptSet,
+} from '../../api/geo-prompt'
+import { useGeoPromptGenerate } from './hooks/useGeoPromptGenerate'
+import { useSubmitState } from './hooks/useSubmitState'
+
+/** 生成表单的字段。 */
+interface GenerateFormValues {
+  count?: number
+  funnelStage?: string
+  promptSetId?: string
+}
+
+/**
+ * 「AI 生成问法」抽屉：填参数 → 生成候选 → 勾选 → 导入。
+ *
+ * ## 为什么不是 `<CrudDrawerForm>`
+ *
+ * 与 `GeoPromptImportDrawer` 同一个理由：`useCrudForm` 的语义是「新建或编辑**一条**记录，
+ * 成功就关抽屉」。这里是三步，而且中间那一步（看候选好不好）恰恰是这个功能的全部价值——
+ * 生成完就关抽屉的话，运营根本没机会挑。
+ *
+ * ## 已经有的那几条为什么还显示出来
+ *
+ * `duplicated` 的条目默认不勾，但留着显示：「这条我已经有了」本身是一个有信息量的结果
+ * （说明这批候选与已有问法方向一致）。藏起来的话，运营点了「生成 10 条」只看到 6 条，
+ * 会以为接口有问题。
+ *
+ * ## 落库为什么走既有的 `POST /prompts/import`
+ *
+ * 生成接口一条都不落库（后端刻意的，见 `geo-prompt.service.ts` 的 `generate()`）。
+ * 导入那条路径上已经有 `textHash` 去重与 `GEO_PROMPT` 配额扣减——再写一条
+ * 「批量建问法」的接口就是让那两件事出现第二份实现。
+ */
+export function GeoPromptGenerateDrawer({
+  brandId,
+  sets,
+  open,
+  onClose,
+  onImported,
+}: {
+  brandId: string
+  sets: GeoPromptSet[]
+  open: boolean
+  onClose: () => void
+  /** 导入成功后回调，通常是 `table.refresh` */
+  onImported: () => void
+}) {
+  const api = useGeoPromptApi()
+  const [form] = Form.useForm<GenerateFormValues>()
+  const gen = useGeoPromptGenerate()
+  const importing = useSubmitState()
+
+  const handleGenerate = async () => {
+    if (brandId === '') {
+      message.warning('先选一个品牌')
+      return
+    }
+    const values = await form.validateFields()
+    await gen.generate({
+      brandId,
+      ...(values.count === undefined ? {} : { count: values.count }),
+      ...(values.funnelStage === undefined ? {} : { funnelStage: values.funnelStage }),
+    })
+  }
+
+  const handleImport = async () => {
+    const texts = gen.selected
+      .map((i) => gen.candidates[i]?.text)
+      .filter((t): t is string => typeof t === 'string' && t !== '')
+    if (texts.length === 0) {
+      message.warning('一条都没勾')
+      return
+    }
+    const values = form.getFieldsValue()
+    await importing.run(async () => {
+      const result = await api.importMany({
+        brandId,
+        ...(values.promptSetId === undefined ? {} : { promptSetId: values.promptSetId }),
+        texts,
+      })
+      onImported()
+      message.success(
+        result.skipped === 0
+          ? `导入了 ${result.created} 条`
+          : `导入了 ${result.created} 条，跳过 ${result.skipped} 条重复的`,
+      )
+      gen.reset()
+    })
+  }
+
+  const handleClose = () => {
+    if (gen.generating || importing.submitting) return
+    gen.reset()
+    form.resetFields()
+    onClose()
+  }
+
+  return (
+    <Drawer title="AI 生成问法" width={760} open={open} onClose={handleClose} destroyOnClose>
+      <Space direction="vertical" size={16} style=\{{ width: '100%' }}>
+        <Alert
+          type="info"
+          showIcon
+          message="生成出来的候选不会自动保存"
+          description="勾选之后点「导入选中的」才会落库并占配额。已经有的那几条默认不勾。"
+        />
+        <Form form={form} layout="inline">
+          <Form.Item name="count" label="生成几条" initialValue={10}>
+            <InputNumber min={1} max={30} precision={0} style=\{{ width: 100 }} />
+          </Form.Item>
+          <Form.Item name="funnelStage" label="漏斗阶段">
+            <Select
+              allowClear
+              style=\{{ width: 160 }}
+              placeholder="各阶段都要"
+              options={[...GEO_FUNNEL_STAGE_OPTIONS]}
+            />
+          </Form.Item>
+          <Form.Item name="promptSetId" label="导入到">
+            <Select
+              allowClear
+              style=\{{ width: 160 }}
+              placeholder="默认集"
+              options={sets.map((set) => ({ label: set.name, value: set.id }))}
+            />
+          </Form.Item>
+          <Form.Item>
+            <Button
+              type="primary"
+              loading={gen.generating}
+              onClick={() => void handleGenerate()}
+            >
+              生成
+            </Button>
+          </Form.Item>
+        </Form>
+
+        <Table<GeoPromptCandidate>
+          size="small"
+          // 候选还没有 id（它们没落库），用**下标**当行 key——这也正是
+          // `selected` 存的东西，两者必须是同一套 key。
+          rowKey={(_row, index) => String(index)}
+          pagination={false}
+          dataSource={gen.candidates}
+          loading={gen.generating}
+          locale=\{{ emptyText: '还没有候选。填好参数点「生成」。' }}
+          rowSelection=\{{
+            selectedRowKeys: gen.selected.map((i) => String(i)),
+            onChange: (keys) => gen.setSelected(keys.map((k) => Number(k))),
+            getCheckboxProps: (row) => ({ disabled: row.duplicated }),
+          }}
+          columns={[
+            { title: '问法', dataIndex: 'text', key: 'text' },
+            {
+              title: '阶段',
+              key: 'funnelStage',
+              width: 90,
+              render: (_v: unknown, row: GeoPromptCandidate) =>
+                GEO_FUNNEL_STAGE_TEXT[row.funnelStage],
+            },
+            {
+              title: '主题',
+              key: 'topic',
+              width: 120,
+              render: (_v: unknown, row: GeoPromptCandidate) => row.topic ?? '-',
+            },
+            {
+              title: '',
+              key: 'duplicated',
+              width: 90,
+              render: (_v: unknown, row: GeoPromptCandidate) =>
+                row.duplicated ? <Tag>已有</Tag> : null,
+            },
+          ]}
+        />
+
+        <Button
+          type="primary"
+          disabled={gen.selected.length === 0}
+          loading={importing.submitting}
+          onClick={() => void handleImport()}
+        >
+          导入选中的（{gen.selected.length}）
+        </Button>
+      </Space>
+    </Drawer>
+  )
+}

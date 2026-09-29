@@ -1,0 +1,15 @@
+{
+  "credits": 2,
+  "data": {
+    "summary": "把 summary 与 webpages 包在 data 里的那一种形状。",
+    "webpages": [
+      {
+        "title": "泰赞 GEO",
+        "link": "https://www.example.org/geo",
+        "snippet": "生成式引擎优化监测平台。",
+        "position": 1,
+        "authors": "泰赞"
+      }
+    ]
+  }
+}

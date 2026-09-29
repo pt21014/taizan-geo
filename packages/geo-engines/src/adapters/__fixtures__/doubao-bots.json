@@ -1,0 +1,44 @@
+{
+  "id": "02174410213780126458cc515458",
+  "object": "chat.completion",
+  "created": 1789000004,
+  "model": "doubao-1-5-pro-32k-250115",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "GEO 监测工具里比较常见的是泰赞GEO 和新榜智汇。"
+      }
+    }
+  ],
+  "references": [
+    {
+      "site_name": "泰赞",
+      "summary": "支持六个国产引擎的可见度监测。",
+      "publish_time": "2026-08-01",
+      "title": "泰赞 GEO",
+      "url": "https://www.example.org/geo",
+      "logo_url": "https://p3-search.byteimg.com/img/mock.jpeg",
+      "mobile_url": "https://m.example.org/geo",
+      "cover_image": { "url": "", "width": 0, "height": 0 }
+    },
+    {
+      "site_name": "新榜",
+      "title": "新榜智汇",
+      "url": "https://geo.newrank.cn/"
+    }
+  ],
+  "bot_usage": {
+    "model_usage": [
+      {
+        "name": "doubao-1-5-pro-32k-250115",
+        "prompt_tokens": 1960,
+        "completion_tokens": 99,
+        "total_tokens": 2059
+      }
+    ],
+    "action_usage": [{ "action_name": "content_plugin", "count": 1 }]
+  }
+}

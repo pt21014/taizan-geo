@@ -1,0 +1,210 @@
+import { Descriptions, Drawer, Empty, Form, Input, Modal, Select, Spin, Table, Tag } from 'antd'
+import { CrudTable, dateTimeColumn, statusTagColumn } from '@taizan/admin-ui'
+import {
+  GEO_REPORT_PERIODS,
+  GEO_REPORT_PERIOD_TEXT,
+  GEO_REPORT_STATUS_TAGS,
+  type GeoReport,
+} from '../../api/geo-report'
+import { useBrandOptions } from './hooks/useBrandOptions'
+import { useGeoReportDetail } from './hooks/useGeoReportDetail'
+import { useGeoReportGenerateForm } from './hooks/useGeoReportGenerateForm'
+import { useGeoReportTable } from './hooks/useGeoReportTable'
+
+const bp = (v: number) => `${(v / 100).toFixed(2)}%`
+
+/**
+ * 报表：CrudTable（列表，不含 payload）+「生成」Modal 表单 + 详情 Drawer（payload 快照）。
+ *
+ * 详情渲染只认 `version: 1`（当前唯一存在过的版本）：payload 是历史快照，口径改了
+ * 老报告不会跟着变（那正是它存在的理由），未来加 version 2 时这里要按版本分支，
+ * 现在先老实报「这份报告的版本我还不认识」而不是硬渲染可能已经变形的字段。
+ */
+export default function GeoReportListPage() {
+  const brands = useBrandOptions()
+  const table = useGeoReportTable()
+  const detail = useGeoReportDetail()
+  const generate = useGeoReportGenerateForm((id) => {
+    table.refresh()
+    detail.openWith(id)
+  })
+
+  return (
+    <>
+      <CrudTable<GeoReport>
+        table={table}
+        title="报表"
+        emptyText="还没有生成过报表"
+        create=\{{ label: '生成报表', perm: 'geo-report:generate', onClick: generate.openForm }}
+        actions={[{ key: 'view', label: '详情', onClick: (row) => detail.openWith(row.id) }]}
+        columns={[
+          { title: '品牌', dataIndex: 'brandName', key: 'brandName', width: 140 },
+          {
+            title: '类型',
+            key: 'period',
+            width: 80,
+            render: (_v: unknown, row: GeoReport) => GEO_REPORT_PERIOD_TEXT[row.period],
+          },
+          { title: '周期', key: 'range', width: 200, render: (_v: unknown, row: GeoReport) => `${row.periodStart} ~ ${row.periodEnd}` },
+          statusTagColumn<GeoReport>({ title: '状态', dataIndex: 'status', map: GEO_REPORT_STATUS_TAGS }),
+          dateTimeColumn({ title: '生成时间', dataIndex: 'createdAt' }),
+        ]}
+      />
+
+      <Modal
+        title="生成报表"
+        open={generate.open}
+        onCancel={generate.closeForm}
+        confirmLoading={generate.submitting}
+        onOk={() => void generate.submit()}
+        okText="生成"
+      >
+        <Form form={generate.antdForm} layout="vertical">
+          <Form.Item name="brandId" label="品牌" rules={[{ required: true, message: '请选一个品牌' }]}>
+            <Select options={brands.options} loading={brands.loading} />
+          </Form.Item>
+          <Form.Item name="period" label="周期类型" initialValue="WEEKLY" rules={[{ required: true }]}>
+            <Select
+              options={GEO_REPORT_PERIODS.map((p) => ({ label: GEO_REPORT_PERIOD_TEXT[p], value: p }))}
+            />
+          </Form.Item>
+          <Form.Item
+            name="periodStart"
+            label="周期第一天"
+            tooltip="WEEKLY 建议传周一，MONTHLY 建议传当月 1 号"
+            rules={[
+              { required: true, message: '请填周期第一天' },
+              { pattern: /^\d{4}-\d{2}-\d{2}$/, message: '格式必须是 YYYY-MM-DD' },
+            ]}
+          >
+            <Input placeholder="2026-09-15" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Drawer title="报表详情" width={760} open={detail.open} onClose={detail.close} destroyOnClose>
+        {detail.loading ? (
+          <Spin />
+        ) : detail.detail === null ? (
+          <Empty description="没有取到这份报告" />
+        ) : (
+          <ReportPayloadView detail={detail.detail} />
+        )}
+      </Drawer>
+    </>
+  )
+}
+
+function ReportPayloadView({ detail }: { detail: NonNullable<ReturnType<typeof useGeoReportDetail>['detail']> }) {
+  const { payload } = detail
+
+  if (payload.version !== 1) {
+    return (
+      <>
+        <Descriptions size="small" column={2} bordered style=\{{ marginBottom: 16 }}>
+          <Descriptions.Item label="品牌">{detail.brandName}</Descriptions.Item>
+          <Descriptions.Item label="周期">
+            {detail.periodStart} ~ {detail.periodEnd}
+          </Descriptions.Item>
+        </Descriptions>
+        <Empty description={`这份报告的 payload version=${payload.version}，还没有对应的渲染器，先看原始 JSON`} />
+        <pre style=\{{ maxHeight: 400, overflow: 'auto', background: 'rgba(0,0,0,0.03)', padding: 12 }}>
+          {JSON.stringify(payload, null, 2)}
+        </pre>
+      </>
+    )
+  }
+
+  interface OverviewRollup {
+    mentionRateBp: number
+    sovBp: number
+    citationRateBp: number
+  }
+  interface EngineRow {
+    engineName: string
+    mentionRateBp: number
+  }
+  interface CompetitorRow {
+    name: string
+    isBrand: boolean
+    sovBp: number
+  }
+  interface CitationRow {
+    domain: string
+    count: number
+  }
+
+  const overview = payload.overview as { current: OverviewRollup; delta: OverviewRollup } | undefined
+  const engines = (payload.engines as { items?: EngineRow[] } | undefined)?.items
+  const competitors = (payload.competitors as { items?: CompetitorRow[] } | undefined)?.items
+  const topCitations = payload.topCitations as CitationRow[] | undefined
+
+  return (
+    <>
+      <Descriptions size="small" column={2} bordered style=\{{ marginBottom: 16 }}>
+        <Descriptions.Item label="品牌">{detail.brandName}</Descriptions.Item>
+        <Descriptions.Item label="周期">
+          {detail.periodStart} ~ {detail.periodEnd}
+        </Descriptions.Item>
+        <Descriptions.Item label="生成时间">{payload.generatedAt}</Descriptions.Item>
+        {overview !== undefined && (
+          <>
+            <Descriptions.Item label="提及率">{bp(overview.current.mentionRateBp)}</Descriptions.Item>
+            <Descriptions.Item label="声量份额">{bp(overview.current.sovBp)}</Descriptions.Item>
+            <Descriptions.Item label="引用率">{bp(overview.current.citationRateBp)}</Descriptions.Item>
+          </>
+        )}
+      </Descriptions>
+
+      {engines !== undefined && engines.length > 0 && (
+        <Table<EngineRow>
+          size="small"
+          rowKey="engineName"
+          pagination={false}
+          dataSource={engines}
+          style=\{{ marginBottom: 16 }}
+          title={() => '引擎对比'}
+          columns={[
+            { title: '引擎', dataIndex: 'engineName', key: 'engineName' },
+            { title: '提及率', key: 'mentionRateBp', render: (_v: unknown, row: EngineRow) => bp(row.mentionRateBp) },
+          ]}
+        />
+      )}
+
+      {competitors !== undefined && competitors.length > 0 && (
+        <Table<CompetitorRow>
+          size="small"
+          rowKey="name"
+          pagination={false}
+          dataSource={competitors}
+          style=\{{ marginBottom: 16 }}
+          title={() => '竞品对比'}
+          columns={[
+            {
+              title: '名称',
+              dataIndex: 'name',
+              key: 'name',
+              render: (v: string, row: CompetitorRow) =>
+                row.isBrand ? <Tag color="blue">{v}（本品牌）</Tag> : v,
+            },
+            { title: '声量份额', key: 'sovBp', render: (_v: unknown, row: CompetitorRow) => bp(row.sovBp) },
+          ]}
+        />
+      )}
+
+      {topCitations !== undefined && topCitations.length > 0 && (
+        <Table<CitationRow>
+          size="small"
+          rowKey="domain"
+          pagination={false}
+          dataSource={topCitations}
+          title={() => '引用来源 Top'}
+          columns={[
+            { title: '域名', dataIndex: 'domain', key: 'domain' },
+            { title: '次数', dataIndex: 'count', key: 'count' },
+          ]}
+        />
+      )}
+    </>
+  )
+}

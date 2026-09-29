@@ -1,0 +1,112 @@
+import { Alert, Button, Drawer, Form, Input, Select, Space, message } from 'antd'
+import { useGeoPromptApi, type GeoPromptSet } from '../../api/geo-prompt'
+import { useSubmitState } from './hooks/useSubmitState'
+
+/** 「批量导入」抽屉表单的字段。 */
+interface ImportFormValues {
+  promptSetId?: string
+  raw?: string
+}
+
+/**
+ * 批量导入问法：一个 textarea，每行一条。
+ *
+ * ## 为什么不是 `<CrudDrawerForm>`
+ *
+ * `useCrudForm` 的语义是「新建或编辑**一条**记录，成功就关抽屉」。导入不是那样：
+ * 它一次建 N 条，而且成功之后最该给出的反馈是 **「建了 12 条，跳过 3 条重复的」**
+ * ——关掉抽屉、刷新表格的话，那个"跳过 3 条"就没了，运营会以为自己少粘了三行。
+ *
+ * 所以这里手写一个提交流程，成功后留在抽屉里报数，由运营自己关。
+ */
+export function GeoPromptImportDrawer({
+  brandId,
+  sets,
+  open,
+  onClose,
+  onImported,
+}: {
+  brandId: string
+  sets: GeoPromptSet[]
+  open: boolean
+  onClose: () => void
+  /** 导入成功后回调，通常是 `table.refresh` */
+  onImported: () => void
+}) {
+  const api = useGeoPromptApi()
+  const [form] = Form.useForm<ImportFormValues>()
+  const submit = useSubmitState()
+
+  const handleSubmit = async () => {
+    const values = await form.validateFields()
+    // 拆行、去首尾空白、丢空行在**前端也做一遍**：后端的 `dedupePrompts` 才是真源，
+    // 但一次导入最多 200 条是 DTO 上的硬限制，把空行也算进去的话，粘 150 行带空行的
+    // 文本会莫名其妙地报「超过 200 条」。
+    const texts = (values.raw ?? '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '')
+    if (texts.length === 0) {
+      message.warning('一条都没有——每行填一个问法')
+      return
+    }
+
+    await submit.run(async () => {
+      const result = await api.importMany({
+        brandId,
+        promptSetId: values.promptSetId,
+        texts,
+      })
+      onImported()
+      message.success(
+        result.skipped === 0
+          ? `导入了 ${result.created} 条`
+          : `导入了 ${result.created} 条，跳过 ${result.skipped} 条重复的`,
+      )
+      form.resetFields()
+    })
+  }
+
+  return (
+    <Drawer
+      title="批量导入问法"
+      width={560}
+      open={open}
+      onClose={submit.submitting ? undefined : onClose}
+      destroyOnClose
+    >
+      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Alert
+          type="info"
+          showIcon
+          message="每行一个问法"
+          description="重复的会按归一化后的正文（去空白、不区分大小写）自动跳过，不会重复占配额。一次最多 200 条。"
+        />
+        <Form form={form} layout="vertical">
+          <Form.Item
+            name="promptSetId"
+            label="归入哪个 Prompt 集"
+            tooltip="不选则归入这个品牌下名为「默认」的集（不存在会自动建一个）"
+          >
+            <Select
+              allowClear
+              placeholder="默认"
+              options={sets.map((set) => ({ label: set.name, value: set.id }))}
+            />
+          </Form.Item>
+          <Form.Item name="raw" label="问法" rules={[{ required: true, message: '至少填一行' }]}>
+            <Input.TextArea
+              rows={12}
+              placeholder={'钛赞 SaaS 好用吗\n有哪些多租户 SaaS 基座推荐\n钛赞和某某比怎么样'}
+            />
+          </Form.Item>
+          <Form.Item>
+            <Button type="primary" loading={submit.submitting} onClick={() => void handleSubmit()}>
+              导入
+            </Button>
+          </Form.Item>
+        </Form>
+      </Space>
+    </Drawer>
+  )
+}

@@ -1,0 +1,546 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// GEO（生成式引擎优化）核心表 —— 租户域，13 张表 + 14 个枚举。
+//
+// 对应《GEO-P0技术设计.md》§3.1。这一批表回答三个问题：
+//   ① **监测什么**（GeoBrand / GeoCompetitor / GeoPromptSet / GeoPrompt）；
+//   ② **问到了什么**（GeoQueryRun / GeoQueryResult 原文 → GeoMention / GeoCitation 结构化）；
+//   ③ **结论是什么**（GeoVisibilityDaily 日聚合 / GeoAlertRule+Event 告警 / GeoReport 报告
+//      / GeoUsageLedger 成本明细账）。
+//
+// 全部遵守 §3.1 的硬约定（每条都有 test/arch/index.spec.ts 的 spec 09/10 看着）：
+//   · 主键 `String @id @db.VarChar(26)`，应用层 ULID，**不写 @default**；
+//   · 一切 `xxxId` 外键列 `@db.VarChar(26)`，但**一条 relation 都不建**；
+//   · `tenantId String @db.VarChar(26)` NOT NULL + `@@index([tenantId, id])`；
+//   · 软删表 `deletedAt DateTime?`，唯一索引必须带 `deletedAt`；
+//   · 指标全整数：比率用基点 `*Bp`（10000 = 100%）、均值用 `*X100`，金额 Int + `Cents`
+//     后缀。**禁 Float / Decimal**——浮点指标在两台机器上聚合出不同的值，
+//     而"品牌可见度掉了 0.3%"这种结论没人能复算。
+//
+// 唯一索引带 deletedAt 的已知代价（MySQL 把 NULL 视为互不相同，活跃行之间不构成硬唯一）
+// 见 @taizan/prisma-base README §7，活跃唯一性由各 service 的 assertXxxAvailable 兜。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 被监测的品牌。【租户域】GEO 的一切都挂在品牌下。
+/// **配额真源之一**：`QuotaKind.GEO_BRAND` 按活跃行数占用，建/删时成对 consume/release。
+model GeoBrand {
+  id          String          @id @db.VarChar(26)
+  tenantId    String          @db.VarChar(26)
+  name        String
+  /// 官网主域名（不带协议），判定引用来源是不是"自有阵地"的依据。
+  domain      String?         @db.VarChar(255)
+  /// 别名/简称/英文名数组，提及识别时一起匹配。`["太赞","{{projectSlug}}"]`
+  aliases     Json
+  /// 所属行业，AI 生成 Prompt 时作为上下文。
+  industry    String?
+  /// 语言/地区，例如 `zh-CN`。同一个品牌在不同地区的可见度是两回事。
+  locale      String?         @db.VarChar(16)
+  status      GeoBrandStatus  @default(ACTIVE)
+  /// 自动跑批频率。PAUSED 的品牌不受它影响（调度先看 status）。
+  refreshFreq GeoRefreshFreq  @default(WEEKLY)
+  /// 每个 Prompt × 引擎重复问几次。生成式回答有随机性，单次采样的结论不可信。
+  sampleSize  Int             @default(3)
+  /// 该品牌启用的引擎 code 数组，取值是平台域 `GeoEngine.code`。
+  engineCodes Json
+  /// 创建人（Staff.id）。**数据范围（@DataScope）的归属列**。
+  createdBy   String?         @db.VarChar(26)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([tenantId, name, deletedAt])
+  @@index([tenantId, id])
+  @@index([tenantId, status])
+  @@index([tenantId, createdBy])
+}
+
+/// 竞品。【租户域】只做"对照组"，不是另一个 GeoBrand——竞品不消耗品牌配额、
+/// 不单独跑批，它只在解析本品牌的回答时被一起识别出来（份额 SoV 的分母）。
+model GeoCompetitor {
+  id        String    @id @db.VarChar(26)
+  tenantId  String    @db.VarChar(26)
+  /// GeoBrand.id。刻意不建外键。
+  brandId   String    @db.VarChar(26)
+  name      String
+  domain    String?   @db.VarChar(255)
+  /// 别名数组，同 GeoBrand.aliases。
+  aliases   Json
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([tenantId, brandId, name, deletedAt])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId])
+}
+
+/// Prompt 集合。【租户域】一组问法的容器，用来区分"手工维护的核心问法"与
+/// "某次 AI 批量生成的候选"——两者的可信度不一样，合并之后就分不出来了。
+model GeoPromptSet {
+  id        String          @id @db.VarChar(26)
+  tenantId  String          @db.VarChar(26)
+  brandId   String          @db.VarChar(26)
+  name      String
+  source    GeoPromptSource @default(MANUAL)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  deletedAt DateTime?
+
+  @@unique([tenantId, brandId, name, deletedAt])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId])
+}
+
+/// 一条被追踪的问法。【租户域】
+/// **配额真源之一**：`QuotaKind.GEO_PROMPT` 按 `isTracked = true` 的活跃行占用。
+model GeoPrompt {
+  id          String         @id @db.VarChar(26)
+  tenantId    String         @db.VarChar(26)
+  brandId     String         @db.VarChar(26)
+  promptSetId String         @db.VarChar(26)
+  /// 问法原文。长文本，唯一性靠 textHash 而不是这一列（VARCHAR 建不了这么长的索引）。
+  text        String         @db.Text
+  /// `sha256(normalize(text))` 的十六进制。归一化规则收口在 prompt.rules.ts，
+  /// 改了规则就等于改了去重口径，必须同步重算存量行。
+  textHash    String         @db.VarChar(64)
+  /// 主题标签，报表按它分组。
+  topic       String?
+  funnelStage GeoFunnelStage @default(UNKNOWN)
+  /// 是否纳入自动跑批。关掉的 Prompt 保留历史数据，但不再产生新查询（也不再占配额）。
+  isTracked   Boolean        @default(true)
+  /// 排序权重，配额不够时优先跑高优先级的。
+  priority    Int            @default(0)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([tenantId, brandId, textHash, deletedAt])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, isTracked])
+  @@index([tenantId, promptSetId])
+}
+
+/// 一次跑批。【租户域】`Prompt × 引擎 × sampleSize` 展开成若干 GeoQueryResult 行。
+/// 职责边界：这张表是**进度与成本的汇总面**（doneQueries / totalCostCents），
+/// 不是配额判定真源（配额在 QuotaCounter），也不是成本对账真源（那是 GeoUsageLedger）。
+/// 三者口径允许有短暂差（跑批中途），对账以 GeoUsageLedger 为准。
+model GeoQueryRun {
+  id            String         @id @db.VarChar(26)
+  tenantId      String         @db.VarChar(26)
+  brandId       String         @db.VarChar(26)
+  triggeredBy   GeoRunTrigger  @default(MANUAL)
+  status        GeoRunStatus   @default(PENDING)
+  /// 本次实际用了哪些引擎 code（快照，不跟随 GeoBrand.engineCodes 变化）。
+  engineCodes   Json
+  /// 本次采样次数快照，同上。
+  sampleSize    Int            @default(1)
+  /// 展开后的查询总数 = Prompt 数 × 引擎数 × sampleSize。
+  totalQueries  Int            @default(0)
+  doneQueries   Int            @default(0)
+  failedQueries Int            @default(0)
+  /// 本次跑批的总成本（分）。明细见 GeoUsageLedger。
+  totalCostCents Int           @default(0)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  /// 失败摘要（前若干条错误的聚合文本），给商家看"为什么是 PARTIAL"。
+  errorSummary  String?        @db.Text
+  createdBy     String?        @db.VarChar(26)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, createdAt])
+  @@index([tenantId, status])
+}
+
+/// 一次「Prompt × 引擎 × 第几次采样」的回答。【租户域】**原文真源**。
+/// 解析产物（GeoMention / GeoCitation）都可以重算，但原文只有这里有一份——
+/// 所以 rawText 落库而不是落对象存储（D6 定稿）。
+model GeoQueryResult {
+  id           String          @id @db.VarChar(26)
+  tenantId     String          @db.VarChar(26)
+  runId        String          @db.VarChar(26)
+  brandId      String          @db.VarChar(26)
+  promptId     String          @db.VarChar(26)
+  /// 平台域 GeoEngine.code 的快照值（引擎行被删了，历史结果还得读得懂）。
+  engineCode   String          @db.VarChar(64)
+  /// 第几次采样，0 起。与 runId/promptId/engineCode 一起构成幂等键——
+  /// 队列重试时同一格子只会有一行，不会把成本算两遍。
+  sampleIndex  Int             @default(0)
+  status       GeoResultStatus @default(PENDING)
+  /// 回答原文。超长时截断并置 rawTruncated，完整体的外部引用放 rawTextRef。
+  rawText      String?         @db.Text
+  /// 原文是否被截断。**不能靠 rawText 长度反推**：阈值会变，变了之后历史行的判定就漂了。
+  rawTruncated Boolean         @default(false)
+  /// 完整原文的外部引用（对象存储 key 之类）。P0 不启用，留列是为了不做第二次迁移。
+  rawTextRef   String?
+  /// 列表页展示用的摘要，避免每次都把 Text 列拖出来。
+  preview      String          @default("") @db.VarChar(500)
+  /// `sha256(normalize(rawText))`，用于识别"同一问法的回答有没有变"。
+  fingerprint  String          @default("") @db.VarChar(64)
+  /// 引擎实际使用的模型名快照。
+  model        String          @default("") @db.VarChar(128)
+  latencyMs    Int             @default(0)
+  inputTokens  Int             @default(0)
+  outputTokens Int             @default(0)
+  /// 引擎联网检索的次数（部分引擎按次计价）。
+  searchCalls  Int             @default(0)
+  /// 本行的成本（分）。
+  costCents    Int             @default(0)
+  /// 失败分类（TIMEOUT / RATE_LIMIT / AUTH / PARSE / …）。
+  /// **刻意是自由文本而不是 DB enum**：值域由 packages/geo-engines 的适配器定义，
+  /// 每接一个新引擎就多几种错误，做成枚举等于每次都要一次库迁移。
+  /// 登记在 test/arch/index.spec.ts 的 ENUM_EXEMPTIONS 里。
+  errorKind    String?         @db.VarChar(64)
+  errorMessage String?         @db.Text
+  /// 引擎返回的时刻。所有下游聚合按它切天，**不按 createdAt**（重试会让 createdAt 漂）。
+  answeredAt   DateTime?
+  /// 解析完成的时刻。为空 = 还没抽取过提及/引用，重算任务按它挑行。
+  analyzedAt   DateTime?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@unique([tenantId, runId, promptId, engineCode, sampleIndex])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, answeredAt])
+  @@index([tenantId, runId, status])
+}
+
+/// 回答里出现的一次品牌/竞品提及。【租户域】由 GeoQueryResult 解析而来，**可重算**。
+/// 重算前先按 resultId 删旧行，否则会翻倍——这也是它不带软删的原因。
+model GeoMention {
+  id             String        @id @db.VarChar(26)
+  tenantId       String        @db.VarChar(26)
+  resultId       String        @db.VarChar(26)
+  brandId        String        @db.VarChar(26)
+  promptId       String        @db.VarChar(26)
+  engineCode     String        @db.VarChar(64)
+  entityKind     GeoEntityKind
+  /// 竞品提及时指向 GeoCompetitor.id；本品牌提及时为空。
+  competitorId   String?       @db.VarChar(26)
+  /// 命中的名字原文（可能是别名），用于人工核对识别质量。
+  entityName     String
+  /// 在回答里的出现次序，1 起。位置越靠前影响越大。
+  position       Int           @default(0)
+  /// 这次提及是否带了来源引用（有引用的提及可信度更高）。
+  isCited        Boolean       @default(false)
+  sentiment      GeoSentiment  @default(NEUTRAL)
+  /// 情感分 −100..100 的整数。**不用 Float**：小数的情感分会让日均值在不同批次里抖。
+  sentimentScore Int           @default(0)
+  /// 提及所在的原文片段。
+  snippet        String        @default("") @db.VarChar(500)
+  /// 冗余自 GeoQueryResult.answeredAt，聚合查询按它切天，省一次 join。
+  answeredAt     DateTime
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, answeredAt])
+  @@index([tenantId, resultId])
+}
+
+/// 回答里引用的一条来源。【租户域】同 GeoMention，由原文解析而来、可重算。
+model GeoCitation {
+  id         String            @id @db.VarChar(26)
+  tenantId   String            @db.VarChar(26)
+  resultId   String            @db.VarChar(26)
+  brandId    String            @db.VarChar(26)
+  promptId   String            @db.VarChar(26)
+  engineCode String            @db.VarChar(64)
+  /// 引用 URL 原文。索引建在 urlHash 上（URL 可以很长）。
+  url        String            @db.Text
+  /// `sha256(normalize(url))`，去重用。
+  urlHash    String            @db.VarChar(64)
+  /// 主机名（已去 www.），"哪些站点在喂 AI"这张图的分组键。
+  domain     String            @db.VarChar(255)
+  /// 平台标识（zhihu / xiaohongshu / wikipedia …），由平台域
+  /// GeoSourcePlatformRule 的规则表匹配而来，未命中时为空串。
+  platform   String            @default("") @db.VarChar(64)
+  category   GeoSourceCategory @default(OTHER)
+  /// 在该回答引用列表里的次序，1 起。
+  rank       Int               @default(0)
+  title      String?
+  /// 冗余自 GeoQueryResult.answeredAt，同 GeoMention。
+  answeredAt DateTime
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, answeredAt])
+  @@index([tenantId, brandId, domain])
+}
+
+/// 可见度日聚合。【租户域】看板与趋势图只读这张表，**不现算**。
+///
+/// `engineCode` / `promptId` 用**空串表示"该维度上的汇总"**（而不是 NULL）：
+/// MySQL 的唯一索引把 NULL 当成互不相同，用 NULL 做汇总维度的话同一天可以插进
+/// 无数行汇总，而且查的时候 `= NULL` 永远不成立。空串是 VarChar 非空 + default ""，
+/// 唯一索引与等值查询都按普通值走。
+/// 于是一天最多有 (引擎数+1) × (Prompt 数+1) 行，`('', '')` 那行是全局汇总。
+model GeoVisibilityDaily {
+  id               String   @id @db.VarChar(26)
+  tenantId         String   @db.VarChar(26)
+  brandId          String   @db.VarChar(26)
+  /// 引擎 code；`''` = 跨引擎汇总。
+  engineCode       String   @default("") @db.VarChar(64)
+  /// GeoPrompt.id；`''` = 跨 Prompt 汇总。
+  promptId         String   @default("") @db.VarChar(26)
+  /// 统计日（按 answeredAt 切天）。
+  date             DateTime @db.Date
+  /// 当天纳入统计的回答条数（分母）。
+  answers          Int      @default(0)
+  /// 其中提到了本品牌的条数（分子）。
+  mentions         Int      @default(0)
+  /// 提及率，基点：10000 = 100%。整数存储，展示时除以 100 得百分数。
+  mentionRateBp    Int      @default(0)
+  /// 声量份额（本品牌提及 ÷ 本品牌+竞品提及），基点。
+  sovBp            Int      @default(0)
+  /// 平均出现位置 ×100（位置 1.25 存 125）。越小越好，无提及时为 0。
+  avgPositionX100  Int      @default(0)
+  /// 带引用的提及占比，基点。
+  citationRateBp   Int      @default(0)
+  /// 平均情感分 ×100，值域 −100..100。**「×100」由 GeoMention.sentimentScore 这一列自己承担**
+  /// （它就是「情感均值 ∈ [-1,1]」乘 100 之后的整数），聚合只取均值、不再乘一次 100。
+  /// 口径的唯一真源是 aggregate/geo-metrics.rules.ts 的 computeMetrics，那里有 spec 钉着。
+  sentimentAvgX100 Int      @default(0)
+  /// 竞品维度的同口径统计快照：`[{competitorId,name,mentions,sovBp}]`。
+  /// 放 Json 而不是拆表：它只被整体读走喂图表，从不单独按竞品查询。
+  competitorStats  Json
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([tenantId, brandId, engineCode, promptId, date])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, date])
+}
+
+/// 告警规则。【租户域】
+model GeoAlertRule {
+  id          String       @id @db.VarChar(26)
+  tenantId    String       @db.VarChar(26)
+  brandId     String       @db.VarChar(26)
+  kind        GeoAlertKind
+  /// 触发阈值，基点（与 GeoVisibilityDaily 的 `*Bp` 同口径）。
+  thresholdBp Int          @default(0)
+  /// 通知通道数组，P0 只允许 `["INBOX"]` 或 `["INBOX","SMS"]`，由 alert.rules.ts 校验。
+  channels    Json
+  enabled     Boolean      @default(true)
+  /// 上次触发时刻，用于静默期去抖（同一规则不会一天刷十条）。
+  lastFiredAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([tenantId, brandId, kind, deletedAt])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId])
+}
+
+/// 告警触发记录。【租户域】规则被改/删之后，历史触发仍然要查得到，所以单独一张表
+/// 并且**不软删**——审计性质的流水不允许被删。
+model GeoAlertEvent {
+  id         String       @id @db.VarChar(26)
+  tenantId   String       @db.VarChar(26)
+  /// GeoAlertRule.id（规则删了也保留这个值，只是查不到规则了）。
+  ruleId     String       @db.VarChar(26)
+  brandId    String       @db.VarChar(26)
+  kind       GeoAlertKind
+  /// 触发时的证据快照：阈值、实际值、对比窗口、涉及的竞品等。
+  payload    Json
+  /// 通知实际发出的时刻。为空 = 还没发（或发失败），补发任务按它挑行。
+  notifiedAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, createdAt])
+}
+
+/// 周报/月报。【租户域】payload 是**生成时的快照**，不随后续数据修正而变——
+/// 商家看到的那份报告和当时发出去的必须是同一份。
+model GeoReport {
+  id          String           @id @db.VarChar(26)
+  tenantId    String           @db.VarChar(26)
+  brandId     String           @db.VarChar(26)
+  period      GeoReportPeriod
+  /// 统计区间起（含）。
+  periodStart DateTime         @db.Date
+  /// 统计区间止（含）。
+  periodEnd   DateTime         @db.Date
+  /// 报告内容快照（各项指标 + 环比 + 竞品对照 + 建议）。
+  payload     Json
+  status      GeoReportStatus  @default(PENDING)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([tenantId, brandId, period, periodStart])
+  @@index([tenantId, id])
+  @@index([tenantId, brandId, periodStart])
+}
+
+/// 用量与成本明细账。【租户域】
+///
+/// **职责边界（D4 定稿，必须记住）**：这张表是**成本与用量的明细账**，服务于平台成本
+/// 看板与对账，**不是配额判定的真源**。配额的真源永远是框架的 `QuotaCounter`
+/// （`quota.consume/release` 走乐观锁物化计数，挂在每个写请求上）。
+/// 两者刻意不互相推导：明细账按 `occurredAt` 补记、可回溯修正，而闸门必须是 O(1) 读；
+/// 拿明细账 `SUM()` 当闸门的下场是每次写请求都全表扫，拿计数器当账本的下场是
+/// 没有任何成本归因。允许两者在跑批途中有短暂差异，对账以本表为准。
+model GeoUsageLedger {
+  id         String         @id @db.VarChar(26)
+  tenantId   String         @db.VarChar(26)
+  /// 归属品牌；平台侧发起的无品牌用量（例如连通性探测）为空。
+  brandId    String?        @db.VarChar(26)
+  /// 归属跑批；非跑批产生的用量（例如单条 AI 内容生成）为空。
+  runId      String?        @db.VarChar(26)
+  metric     GeoUsageMetric
+  /// 引擎 code；与引擎无关的用量（LLM 分析）为空。
+  engineCode String?        @db.VarChar(64)
+  /// 计量数量：QUERY 是次数、LLM_TOKEN 是 token 数、CONTENT_GEN 是篇数。
+  /// **列名不叫 amount**：`amount` 会被 spec 09 的金额列规则判成金额并要求 `Cents`
+  /// 后缀，而这里是数量不是钱。钱在下面那一列。
+  quantity   Int            @default(0)
+  /// 这条用量折算的成本（分）。
+  costCents  Int            @default(0)
+  /// 归属月份 `YYYY-MM`。冗余一列是为了让月度汇总走索引而不是对 occurredAt 做函数运算
+  /// （MySQL 对列做函数就用不上索引了）。
+  month      String         @db.VarChar(7)
+  /// 用量发生的时刻（不是入账时刻）。补记的行 createdAt 会晚于它。
+  occurredAt DateTime
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@index([tenantId, id])
+  @@index([tenantId, month, metric])
+  @@index([tenantId, brandId, occurredAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 枚举（14 个）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 品牌监测状态。PAUSED 保留全部历史数据，只是不再产生新查询。
+enum GeoBrandStatus {
+  ACTIVE
+  PAUSED
+}
+
+/// 自动跑批频率。P0 只有两档——更细的频率不是排期问题，是成本问题。
+enum GeoRefreshFreq {
+  WEEKLY
+  DAILY
+}
+
+/// Prompt 来源。可信度不同，报表里要能分开看。
+enum GeoPromptSource {
+  /// 人工录入。
+  MANUAL
+  /// AI 批量生成。
+  AI_GEN
+  /// 批量导入（CSV / 搜索词表）。
+  IMPORT
+}
+
+/// 购买漏斗阶段。UNKNOWN 是默认值而不是让列可空：可空的枚举在分组统计里
+/// 会多出一个看不见的桶，报表上表现为"总数对不上"。
+enum GeoFunnelStage {
+  /// 认知期（这类产品是什么）。
+  TOFU
+  /// 比较期（A 和 B 哪个好）。
+  MOFU
+  /// 决策期（在哪买、多少钱）。
+  BOFU
+  UNKNOWN
+}
+
+/// 跑批触发来源。
+enum GeoRunTrigger {
+  /// cron 按 refreshFreq 自动发起。
+  SCHEDULE
+  /// 商家在页面上点的。
+  MANUAL
+}
+
+/// 跑批状态。DONE 与 PARTIAL 分开：部分失败仍然出数据，但结论的置信度不一样，
+/// 合并成一个 DONE 之后没人知道那天的曲线为什么塌了一块。
+enum GeoRunStatus {
+  PENDING
+  RUNNING
+  DONE
+  /// 有失败但有可用结果。
+  PARTIAL
+  /// 全部失败。
+  FAILED
+}
+
+/// 单条查询结果的状态。
+enum GeoResultStatus {
+  PENDING
+  OK
+  FAILED
+}
+
+/// 提及的实体类型。
+enum GeoEntityKind {
+  BRAND
+  COMPETITOR
+}
+
+/// 提及的情感倾向。
+enum GeoSentiment {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+/// 引用来源的归类。决定了优化动作：OWNED 说明自有内容被采信，
+/// COMPETITOR 说明 AI 在拿对手的材料回答关于你的问题。
+enum GeoSourceCategory {
+  /// 自有阵地（官网、官方账号）。
+  OWNED
+  /// 竞品阵地。
+  COMPETITOR
+  /// 第三方媒体/测评。
+  EARNED
+  /// 社区与社交平台（知乎、小红书…）。
+  SOCIAL
+  /// 百科类。
+  ENCYCLOPEDIA
+  /// 新闻稿/PR 渠道。
+  PR
+  OTHER
+}
+
+/// 告警类型。
+enum GeoAlertKind {
+  /// 可见度（提及率）跌破阈值。
+  VISIBILITY_DROP
+  /// 竞品声量份额反超。
+  COMPETITOR_OVERTAKE
+  /// 出现负面提及。
+  NEGATIVE_MENTION
+}
+
+/// 报告周期。
+enum GeoReportPeriod {
+  WEEKLY
+  MONTHLY
+}
+
+/// 报告生成状态。
+enum GeoReportStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+/// 用量计量维度。与 QuotaKind 的对应关系：QUERY → GEO_QUERY_MONTHLY、
+/// CONTENT_GEN → GEO_CONTENT_MONTHLY；LLM_TOKEN 只入账不设闸门
+/// （token 数是成本口径，商家理解不了，闸门按"次数"卖）。
+enum GeoUsageMetric {
+  /// 一次引擎查询。
+  QUERY
+  /// 一次 LLM 调用消耗的 token。
+  LLM_TOKEN
+  /// 一篇 AI 生成内容。
+  CONTENT_GEN
+}

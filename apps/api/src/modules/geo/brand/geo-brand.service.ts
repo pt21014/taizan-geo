@@ -1,0 +1,469 @@
+/**
+ * 监测品牌 + 竞品的数据访问层。
+ *
+ * ## 全文没有一处 `tenantId`
+ *
+ * 与 `example-goods/goods.service.ts` 同一条约定，`test/arch/no-manual-tenant-filter.spec.ts`
+ * （spec 4）扫的就是这件事。每一次查询都走 `prisma.tenant`，租户条件由隔离扩展用 `AND`
+ * 包裹注入，调用方**覆盖不掉**。手写 `where.tenantId` 的问题不是「写了会错」，
+ * 而是「漏写不会报错」——漏写的那一个查询会安静地返回全平台的数据。
+ *
+ * ## 跨租户 / 不存在，统一 1240300
+ *
+ * 与 goods 一致：不区分「不存在」与「是别人的」。区分了就等于提供一个
+ * 「这个 id 在不在别人家」的存在性探测器。
+ *
+ * ## 配额
+ *
+ * `QuotaKind.GEO_BRAND` 是**存量型**配额（建一个 +1、删一个 −1，与 STAFF 同形）：
+ * 先 `consume` 再写库，写失败 `release`；软删时 `release`。顺序不能反——
+ * 反过来的话超限时业务数据已经落库了，而「回滚一条刚建好的品牌」比
+ * 「把多占的配额还回去」难得多。
+ *
+ * **竞品不占配额**：它是对照组，不单独跑批、不单独计费。它的上限是
+ * `geo-brand.rules.ts` 的 `MAX_COMPETITORS` 常量。
+ *
+ * @packageDocumentation
+ */
+
+import { Inject, Injectable } from '@nestjs/common'
+import type { GeoBrand, GeoCompetitor, Prisma } from '@prisma/client'
+import { ErrorCode, normalizePage, type PageResult } from '@taizan/contracts'
+import { QuotaService } from '@taizan/nest-billing'
+import { BizException, currentContext } from '@taizan/nest-core'
+import { PrismaService } from '@taizan/nest-prisma'
+import { mergeScopeWhere } from '@taizan/rbac-core'
+
+import { autoTenantData, type AppPrismaService } from '../../../common/prisma.types'
+import { assertEngineCodesExist } from '../engine/geo-engine.rules'
+import { GeoEngineService } from '../engine/geo-engine.service'
+import type {
+  CreateGeoBrandDto,
+  CreateGeoCompetitorDto,
+  GeoBrandView,
+  GeoCompetitorView,
+  ListGeoBrandQueryDto,
+  UpdateGeoBrandDto,
+  UpdateGeoCompetitorDto,
+} from './dto/geo-brand.dto'
+import {
+  assertCompetitorLimit,
+  GEO_DEFAULT_LOCALE,
+  normalizeAliases,
+  normalizeBrandName,
+  normalizeDomain,
+  normalizeEngineCodes,
+  validateBrandInput,
+  validateBrandPatch,
+  type GeoBrandStatusLike,
+  type GeoRefreshFreqLike,
+  type RuleViolation,
+} from './geo-brand.rules'
+
+/**
+ * 品牌数占用哪一档配额。
+ *
+ * `GEO_BRAND` 是框架 `02-plan.prisma` 里 `QuotaKind` 的一个真实枚举值
+ * （由 T3 的 schema 改动加入），不是借用 `CUSTOM`——品牌数是这个产品最主要的
+ * 售卖维度，套餐页上必须能写成「监测品牌数：3」而不是「CUSTOM：3」。
+ */
+const GEO_BRAND_QUOTA_KIND = 'GEO_BRAND'
+
+/**
+ * 「一个品牌最多能选几个引擎」占哪一档配额。
+ *
+ * ## 为什么用 `quota.check` / `quota.usage` 而不是 `quota.consume`
+ *
+ * `GEO_ENGINE` 的语义与 `GEO_BRAND` / `GEO_PROMPT` **不是同一种**：那两档是
+ * 「存量」（建一个 +1、删一个 −1，`QuotaCounter` 里真的有一行在加减），
+ * 而这一档是「**上限**」——套餐卖的是「你的品牌最多能同时监测几个引擎」，
+ * 不是「你一共能启用几个引擎」。
+ *
+ * 按存量做的话立刻出两个问题：① 一个品牌选了 3 个、另一个品牌选了同样的 3 个，
+ * 计数应该是 3 还是 6？② 改品牌时把 `["mock","qwen"]` 换成 `["qwen","ernie"]`，
+ * 要先 release 2 再 consume 2，中间任何一步失败计数就永久错位。
+ *
+ * 所以这里只读**限额**（`quota.usage(kind).limit`），拿它和这一次提交的
+ * `engineCodes.length` 比。`QuotaCounter` 里永远不会有 `GEO_ENGINE` 这一行——
+ * 这是刻意的，不是漏了。
+ *
+ * 顶栏那一排（`registry/quota-kinds.ts` 的 `BOOTSTRAP_QUOTA_KINDS`）里仍然带着
+ * 它：商家要看得到「我这一档最多能选几个引擎」，而 `usage()` 对没有计数行的
+ * kind 回的是 `{ limit, used: 0 }`——正是要显示的东西。
+ */
+const GEO_ENGINE_QUOTA_KIND = 'GEO_ENGINE'
+
+/**
+ * `GeoBrand.aliases` / `engineCodes` 在库里是 `Json` 列。
+ *
+ * Prisma 读回来的类型是 `Prisma.JsonValue`（可能是任何 JSON），而业务层约定它一定是
+ * 字符串数组。这个函数是那条约定的唯一落点——散在各处写 `as string[]` 的话，
+ * 某天一条脏数据（比如手工改库改成了对象）会让页面白屏而不是显示成空列表。
+ */
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
+function toBrandView(row: GeoBrand): GeoBrandView {
+  return {
+    id: row.id,
+    name: row.name,
+    domain: row.domain,
+    aliases: toStringArray(row.aliases),
+    industry: row.industry,
+    locale: row.locale,
+    status: row.status as GeoBrandStatusLike,
+    refreshFreq: row.refreshFreq as GeoRefreshFreqLike,
+    sampleSize: row.sampleSize,
+    engineCodes: toStringArray(row.engineCodes),
+    createdBy: row.createdBy,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  }
+}
+
+function toCompetitorView(row: GeoCompetitor): GeoCompetitorView {
+  return {
+    id: row.id,
+    brandId: row.brandId,
+    name: row.name,
+    domain: row.domain,
+    aliases: toStringArray(row.aliases),
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  }
+}
+
+function rejectViolations(violations: readonly RuleViolation[]): void {
+  if (violations.length === 0) return
+  throw new BizException(ErrorCode.BAD_REQUEST, violations.map((v) => v.message).join('；'), {
+    violations,
+  })
+}
+
+@Injectable()
+export class GeoBrandService {
+  constructor(
+    @Inject(PrismaService) private readonly prisma: AppPrismaService,
+    @Inject(QuotaService) private readonly quota: QuotaService,
+    // 引擎清单是**平台域**的（`GeoEngine`），品牌这边只能问它要一份「当前启用了
+    // 哪些 code」。不自己查库是因为那张表走 `RawPrismaService`，而本文件全程
+    // `prisma.tenant`——一个文件里两种句柄是 spec 3 与 spec 4 最容易被绕过的地方。
+    @Inject(GeoEngineService) private readonly engines: GeoEngineService,
+  ) {}
+
+  // ── 品牌 ────────────────────────────────────────────────────────────────
+
+  /**
+   * 分页列表。软删的行由软删扩展自动过滤掉，这里不写 `deletedAt`。
+   *
+   * @param scope - `DataScopeInterceptor` 算好的数据范围片段。**`null` 与 `{}` 不是一回事**：
+   *   `null` = 不加条件（`ALL` 范围），`{}` = 一个空对象条件。所以这里必须走
+   *   `mergeScopeWhere` 而不是对象展开——后者在 `scope` 是 `{ createdBy: null }` 之类的
+   *   形状时会覆盖掉同名的业务条件。
+   */
+  async list(
+    query: ListGeoBrandQueryDto,
+    scope: Record<string, unknown> | null = null,
+  ): Promise<PageResult<GeoBrandView>> {
+    const { page, pageSize } = normalizePage(query)
+
+    const filters: Prisma.GeoBrandWhereInput = {}
+    if (query.status) filters.status = query.status
+    const keyword = query.keyword?.trim()
+    if (keyword) {
+      // 名称或域名任一命中。`OR` 与隔离扩展注入的租户条件是 `AND` 关系
+      // （扩展把整个 where 包进 `AND`），所以这里写 `OR` 不会漏出别家的数据。
+      filters.OR = [{ name: { contains: keyword } }, { domain: { contains: keyword } }]
+    }
+
+    const where = mergeScopeWhere(filters, scope)
+
+    const [rows, total] = await Promise.all([
+      this.prisma.tenant.geoBrand.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.tenant.geoBrand.count({ where }),
+    ])
+
+    return { items: rows.map(toBrandView), total, page, pageSize }
+  }
+
+  /** 取一条。不属于本店（或不存在）→ 1240300。 */
+  async get(id: string): Promise<GeoBrandView> {
+    return toBrandView(await this.requireBrand(id))
+  }
+
+  /** 新建。ULID 主键与 `tenantId` 都由扩展注入，这里一个都不写。 */
+  async create(dto: CreateGeoBrandDto): Promise<GeoBrandView> {
+    // 校验的是**生效之后**的输入，不是原始 DTO：`locale` / `status` / `refreshFreq` /
+    // `sampleSize` 在 DTO 上都是可选的，把 `undefined` 直接喂给规则函数会被判成
+    // 「必填没填」。默认值只能有一处真源，就是下面这几个 `??`。
+    const effective = {
+      ...dto,
+      locale: dto.locale ?? GEO_DEFAULT_LOCALE,
+      status: dto.status ?? 'ACTIVE',
+      refreshFreq: dto.refreshFreq ?? 'WEEKLY',
+      sampleSize: dto.sampleSize ?? 3,
+    }
+    rejectViolations(validateBrandInput(effective))
+
+    const name = normalizeBrandName(dto.name)
+    await this.assertBrandNameAvailable(name)
+
+    const engineCodes = normalizeEngineCodes(dto.engineCodes)
+    await this.assertEngineCodes(engineCodes)
+
+    // ── 配额：先占，再写 ──────────────────────────────────────────────
+    await this.quota.consume(GEO_BRAND_QUOTA_KIND)
+
+    let row: GeoBrand
+    try {
+      row = await this.prisma.tenant.geoBrand.create({
+        data: autoTenantData<Prisma.GeoBrandCreateInput>({
+          name,
+          domain: normalizeDomain(dto.domain),
+          aliases: normalizeAliases(dto.aliases),
+          industry: dto.industry?.trim() || null,
+          locale: effective.locale,
+          status: effective.status,
+          refreshFreq: effective.refreshFreq,
+          sampleSize: effective.sampleSize,
+          // 存在性与配额都在上面的 `assertEngineCodes()` 里判过了（T5 落地）。
+          engineCodes,
+          // 数据范围的归属列。取自请求上下文而不是入参：让调用方传 `createdBy`
+          // 等于让它可以伪造成别人建的，那样 `SELF` 范围就形同虚设。
+          createdBy: currentContext()?.identity?.id ?? null,
+        }),
+      })
+    } catch (error) {
+      // 补偿：占了配额但没建成，得还回去。不还的话计数会虚高，而虚高的计数
+      // 没有任何人会去修，最终表现为「明明只有 2 个品牌却说超了」。
+      await this.quota.release(GEO_BRAND_QUOTA_KIND).catch(() => undefined)
+      throw error
+    }
+
+    return toBrandView(row)
+  }
+
+  /** 修改。只改传了的字段。 */
+  async update(id: string, dto: UpdateGeoBrandDto): Promise<GeoBrandView> {
+    rejectViolations(validateBrandPatch(dto))
+    const current = await this.requireBrand(id)
+
+    const name = dto.name === undefined ? undefined : normalizeBrandName(dto.name)
+    if (name !== undefined && name !== current.name) {
+      await this.assertBrandNameAvailable(name)
+    }
+
+    const engineCodes =
+      dto.engineCodes === undefined ? undefined : normalizeEngineCodes(dto.engineCodes)
+    if (engineCodes !== undefined) await this.assertEngineCodes(engineCodes)
+
+    const row = await this.prisma.tenant.geoBrand.update({
+      where: { id },
+      data: {
+        ...(name !== undefined ? { name } : {}),
+        ...(dto.domain !== undefined ? { domain: normalizeDomain(dto.domain) } : {}),
+        ...(dto.aliases !== undefined ? { aliases: normalizeAliases(dto.aliases) } : {}),
+        ...(dto.industry !== undefined ? { industry: dto.industry.trim() || null } : {}),
+        ...(dto.locale !== undefined ? { locale: dto.locale } : {}),
+        ...(dto.status !== undefined ? { status: dto.status } : {}),
+        ...(dto.refreshFreq !== undefined ? { refreshFreq: dto.refreshFreq } : {}),
+        ...(dto.sampleSize !== undefined ? { sampleSize: dto.sampleSize } : {}),
+        ...(engineCodes !== undefined ? { engineCodes } : {}),
+      },
+    })
+
+    return toBrandView(row)
+  }
+
+  /**
+   * 删除。**软删**——`delete()` 被软删扩展改写成 `update{ deletedAt: now }`。
+   *
+   * 竞品 / Prompt / 历史数据**不级联删**：删品牌只是"不再监测它了"，
+   * 半年的可见度趋势还在库里，而那是这个产品最值钱的部分。真要清理是另一条
+   * 运维路径（T8 的数据保留策略），不该由一个后台按钮触发。
+   */
+  async remove(id: string): Promise<{ id: string }> {
+    await this.requireBrand(id)
+    await this.prisma.tenant.geoBrand.delete({ where: { id } })
+    // 删了就把配额还回去。软删的行不再占名额——否则「删了 3 个再建 3 个」会超限，
+    // 而商家看到的品牌数明明没变。
+    await this.quota.release(GEO_BRAND_QUOTA_KIND)
+    return { id }
+  }
+
+  // ── 竞品 ────────────────────────────────────────────────────────────────
+
+  /** 某个品牌下的竞品列表（不分页——上限只有 {@link MAX_COMPETITORS} 条）。 */
+  async listCompetitors(brandId: string): Promise<GeoCompetitorView[]> {
+    await this.requireBrand(brandId)
+    const rows = await this.prisma.tenant.geoCompetitor.findMany({
+      where: { brandId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    })
+    return rows.map(toCompetitorView)
+  }
+
+  /** 新建竞品。不占配额，只受 {@link MAX_COMPETITORS} 常量约束。 */
+  async createCompetitor(
+    brandId: string,
+    dto: CreateGeoCompetitorDto,
+  ): Promise<GeoCompetitorView> {
+    await this.requireBrand(brandId)
+
+    const name = normalizeBrandName(dto.name)
+    if (name === '') {
+      throw new BizException(ErrorCode.BAD_REQUEST, '竞品名不能为空（去掉首尾空白之后）')
+    }
+
+    const count = await this.prisma.tenant.geoCompetitor.count({ where: { brandId } })
+    rejectViolations(assertCompetitorLimit(count))
+    await this.assertCompetitorNameAvailable(brandId, name)
+
+    const row = await this.prisma.tenant.geoCompetitor.create({
+      data: autoTenantData<Prisma.GeoCompetitorCreateInput>({
+        brandId,
+        name,
+        domain: normalizeDomain(dto.domain),
+        aliases: normalizeAliases(dto.aliases),
+      }),
+    })
+    return toCompetitorView(row)
+  }
+
+  /** 修改竞品。 */
+  async updateCompetitor(
+    brandId: string,
+    competitorId: string,
+    dto: UpdateGeoCompetitorDto,
+  ): Promise<GeoCompetitorView> {
+    const current = await this.requireCompetitor(brandId, competitorId)
+
+    const name = dto.name === undefined ? undefined : normalizeBrandName(dto.name)
+    if (name === '') {
+      throw new BizException(ErrorCode.BAD_REQUEST, '竞品名不能为空（去掉首尾空白之后）')
+    }
+    if (name !== undefined && name !== current.name) {
+      await this.assertCompetitorNameAvailable(brandId, name)
+    }
+
+    const row = await this.prisma.tenant.geoCompetitor.update({
+      where: { id: competitorId },
+      data: {
+        ...(name !== undefined ? { name } : {}),
+        ...(dto.domain !== undefined ? { domain: normalizeDomain(dto.domain) } : {}),
+        ...(dto.aliases !== undefined ? { aliases: normalizeAliases(dto.aliases) } : {}),
+      },
+    })
+    return toCompetitorView(row)
+  }
+
+  /** 删除竞品（软删）。 */
+  async removeCompetitor(brandId: string, competitorId: string): Promise<{ id: string }> {
+    await this.requireCompetitor(brandId, competitorId)
+    await this.prisma.tenant.geoCompetitor.delete({ where: { id: competitorId } })
+    return { id: competitorId }
+  }
+
+  // ── 内部 ────────────────────────────────────────────────────────────────
+
+  /**
+   * 拿到一条属于本店的品牌，否则 1240300。
+   *
+   * 用 `findFirst` 而不是 `findUnique`：两者在隔离层的待遇不同——`findFirst` 的租户条件
+   * 是 `AND` 包进 `where` 的（查不到就是查不到），`findUnique` 是先查后校验归属
+   * （命中别人家的记录时返回 `null`，还多一次读）。既然结论都要收敛成 1240300，
+   * 用前者更直接，也少一次查询。
+   *
+   * **公开给 Prompt 模块用**：建 Prompt 时要确认 `brandId` 属于当前租户，
+   * 那条校验与这里是同一件事，复制一份的结果是两边的错误码慢慢走偏。
+   */
+  async requireBrand(id: string): Promise<GeoBrand> {
+    const row = await this.prisma.tenant.geoBrand.findFirst({ where: { id } })
+    if (!row) {
+      throw new BizException(ErrorCode.CROSS_TENANT_FORBIDDEN, '品牌不存在，或不属于当前店铺')
+    }
+    return row
+  }
+
+  /** 拿到一条属于本店、且挂在指定品牌下的竞品，否则 1240300。 */
+  private async requireCompetitor(brandId: string, competitorId: string): Promise<GeoCompetitor> {
+    await this.requireBrand(brandId)
+    const row = await this.prisma.tenant.geoCompetitor.findFirst({
+      where: { id: competitorId, brandId },
+    })
+    if (!row) {
+      throw new BizException(ErrorCode.CROSS_TENANT_FORBIDDEN, '竞品不存在，或不属于这个品牌')
+    }
+    return row
+  }
+
+  /**
+   * 引擎 code 的两道闸门：**存在性**与**数量上限**。
+   *
+   * ## 顺序：先存在性、后配额
+   *
+   * 填了一个不存在的 code 又正好超了额度时，该先说的是「没有这个引擎」——
+   * 先报配额的话，运营会去升套餐，升完发现还是不行。
+   *
+   * ## 为什么存在性校验必须落在这里，而不是纯函数里
+   *
+   * `geo-brand.rules.ts` 是纯函数，读不到库；而「有哪些引擎、启用了没」在
+   * 平台域表 `GeoEngine` 里，还会随平台运营的一次点击改变。写死在前端或规则里
+   * 的后果是：平台停用了一个引擎，商家的下拉框里它还在，选了保存下去，
+   * **跑批时静默跳过**——而商家以为自己在监测它。
+   *
+   * @param codes - 已归一（小写、去重）的引擎 code
+   * @throws `BizException` 1040000 有 code 不在启用集合里
+   * @throws `BizException` 1540301 选的个数超过套餐的 `GEO_ENGINE` 上限
+   */
+  private async assertEngineCodes(codes: readonly string[]): Promise<void> {
+    if (codes.length === 0) return
+
+    rejectViolations(assertEngineCodesExist(codes, await this.engines.enabledCodes()))
+
+    // 只读限额，不 consume——`GEO_ENGINE` 是「最多能选几个」而不是存量，
+    // 理由写在 `GEO_ENGINE_QUOTA_KIND` 的注释里。
+    const { limit } = await this.quota.usage(GEO_ENGINE_QUOTA_KIND)
+    // `null` = 不限量（三态里的第一态）。`0` 是「一个都不给」，不是「不限」。
+    if (limit !== null && codes.length > limit) {
+      throw new BizException(
+        ErrorCode.QUOTA_EXCEEDED,
+        `当前套餐一个品牌最多可选 ${limit} 个监测引擎（这次选了 ${codes.length} 个）`,
+        { kind: GEO_ENGINE_QUOTA_KIND, limit, requested: codes.length },
+      )
+    }
+  }
+
+  /**
+   * 活跃品牌名不能重复。
+   *
+   * 为什么不能只靠 `@@unique([tenantId, name, deletedAt])`：MySQL 把 `NULL` 视为
+   * 互不相同，所以两行 `deletedAt IS NULL` 的同名记录**不违反**那个唯一索引
+   * （`@taizan/prisma-base` README §7 记了这条已知取舍）。带上 `deletedAt` 是为了
+   * 软删之后还能建回同名品牌；活跃行的唯一性就只能由应用层兜。
+   *
+   * 已知残余风险：两个并发请求可能同时通过这个检查——与 `goods.service.ts` 同源，
+   * 根治要改软删扩展的写路径契约，是跨包决策。
+   */
+  private async assertBrandNameAvailable(name: string): Promise<void> {
+    const existing = await this.prisma.tenant.geoBrand.findFirst({ where: { name } })
+    if (existing) {
+      throw new BizException(ErrorCode.BAD_REQUEST, `已经有一个叫「${name}」的监测品牌了`)
+    }
+  }
+
+  /** 同一个品牌下活跃竞品名不能重复（理由同上）。 */
+  private async assertCompetitorNameAvailable(brandId: string, name: string): Promise<void> {
+    const existing = await this.prisma.tenant.geoCompetitor.findFirst({ where: { brandId, name } })
+    if (existing) {
+      throw new BizException(ErrorCode.BAD_REQUEST, `这个品牌下已经有一个叫「${name}」的竞品了`)
+    }
+  }
+}

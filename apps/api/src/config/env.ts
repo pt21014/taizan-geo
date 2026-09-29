@@ -1,0 +1,294 @@
+/**
+ * `apps/api` 的 env 契约 = 框架基线（`BASE_ENV_SCHEMA`）+ 本应用自己的字段。
+ *
+ * 单一真源就是这个文件：`.env.example` 由它生成（`pnpm taizan:env-example`），
+ * `CoreModule.forRoot({ envSchema: APP_ENV_SCHEMA })` 由它校验，
+ * `ConfigService<AppEnv>` 的类型也来自它。手写 `.env.example` 必然漏字段，所以不手写。
+ *
+ * @packageDocumentation
+ */
+
+import { BILLING_ENV_SHAPE } from '@taizan/nest-billing'
+import { INFRA_ENV_SHAPE } from '@taizan/nest-infra'
+import { BASE_ENV_SCHEMA, defineEnvSchema } from '@taizan/nest-core'
+import { z } from 'zod'
+
+/** 从 env 字符串解析布尔（与 nest-core 的 `envBoolean` 同语义，那个没导出）。 */
+function envBoolean(defaultValue: boolean): z.ZodTypeAny {
+  return z
+    .preprocess((raw) => {
+      if (raw === undefined || raw === '') return defaultValue
+      if (typeof raw === 'boolean') return raw
+      const s = String(raw).trim().toLowerCase()
+      if (['1', 'true', 'yes', 'on'].includes(s)) return true
+      if (['0', 'false', 'no', 'off'].includes(s)) return false
+      // 拼错（`ture`）不静默当 false——那种 bug 只会在出事的时候才被发现。
+      return raw
+    }, z.boolean())
+    .default(defaultValue)
+}
+
+/**
+ * GEO 分析 LLM 的可选供应商名。
+ *
+ * 取值与 `@taizan/llm` 里三个 provider 的 `name` 字段**逐字对齐**
+ * （`MockLlmProvider.name = 'mock'` 等），`geo-llm.provider.ts` 直接拿它当 registry 的 key。
+ * 定义在这里而不是那个文件里：env 的枚举必须在 env schema 这一层就收窄，
+ * 否则拼错一个字母要等到第一次跑分析 job 才炸，而那是在夜里三点。
+ */
+export const GEO_LLM_PROVIDER_NAMES = ['mock', 'openai-compatible', 'dashscope'] as const
+
+/** {@link GEO_LLM_PROVIDER_NAMES} 的联合类型。 */
+export type GeoLlmProviderName = (typeof GEO_LLM_PROVIDER_NAMES)[number]
+
+/**
+ * 短信厂商名，取值与 `@taizan/sms` 里 provider 的 `name` 字段逐字对齐
+ * （`MockSmsProvider.name = 'mock'`、`LuosimaoSmsProvider.name = 'luosimao'`），
+ * `notify/channels.ts` 直接拿它当 registry 的 key。理由与 {@link GEO_LLM_PROVIDER_NAMES} 同——
+ * 枚举必须在 env schema 这一层收窄，拼错一个字母不该等到第一条通知发送失败才发现。
+ */
+export const SMS_PROVIDER_NAMES = ['mock', 'luosimao'] as const
+
+/** {@link SMS_PROVIDER_NAMES} 的联合类型。 */
+export type SmsProviderName = (typeof SMS_PROVIDER_NAMES)[number]
+
+/** 本应用在框架基线之上追加的 env 字段。 */
+export const APP_ENV_SHAPE = {
+  APP_NAME: z
+    .string()
+    .min(1)
+    .default('taizan-saas')
+    .describe('应用名，出现在 Swagger 标题与日志里'),
+
+  TENANT_BASE_DOMAIN: z
+    .string()
+    .optional()
+    .describe(
+      'C 端子域名解析的根域，例如 example.com（`shop-a.example.com` → slug `shop-a`）。本地不配即可，SubdomainResolver 会退化成不适用',
+    ),
+
+  CLIENT_DEV_LOGIN: envBoolean(false).describe(
+    '【危险·联调用】开启 POST /api/client/auth/login-dev：只给手机号就签发会员 token，不发短信不校验。生产环境置真会拒启',
+  ),
+
+  SIGNUP_ENABLED: envBoolean(true).describe(
+    '官网自助注册总开关（POST /api/public/signup、GET /api/public/signup/check-slug）。' +
+      '关掉之后接口仍在、仍限流，但一律回 1040000 —— 这是唯一「谁都能调且会往库里写」的入口，' +
+      '必须有一个不改代码、不改路由就能立刻关掉它的开关',
+  ),
+
+  SIGNUP_TRIAL_DAYS: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(3650)
+    .default(14)
+    .describe(
+      '自助注册开出来的店试用几天（落到 Tenant.trialEndAt = 当天最后一刻）。' +
+        '0 表示「注册即到期」——那是一个可用的运营选择（先注册后付费），不是错误值',
+    ),
+
+  SIGNUP_TRIAL_AUTO_PLAN: z
+    .string()
+    .optional()
+    .describe(
+      '试用到期未购买时自动挂上的免费套餐 code（`Plan.code`）。不配（默认）= 试用到期后' +
+        '保持 TRIAL 状态不动，由 `evaluateTenantGate` 现算打烊，续费白名单仍可写；' +
+        '配了 = `trial-convert` cron 通过 PlanOrderService 的统一 fulfill 路径把这些' +
+        '租户 0 元「续」到这档套餐上（见 `plan-lifecycle/trial-convert.cron.ts` 文件头）',
+    ),
+
+  PAY_FAKE_ENABLED: envBoolean(false).describe(
+    '【危险·联调用】给 PaymentModule 装 FakeProvider 并暴露 FakePaymentTestKit：' +
+      '带真 HMAC 签名的「假回调」可以直接兑现真权益（套餐续期）。e2e 与本地联调用，生产环境置真会拒启',
+  ),
+
+  // ── T6 GEO 分析 LLM（`modules/geo/analysis/geo-llm.provider.ts` 读这四个） ──
+
+  GEO_LLM_PROVIDER: z
+    .enum(GEO_LLM_PROVIDER_NAMES)
+    .default('mock')
+    .superRefine((value, ctx) => {
+      // 为什么这条校验在**字段级**而不是对象级 `superRefine`：
+      // `APP_ENV_SCHEMA` 必须保持是一个 `ZodObject`——`scripts/gen-env-example.ts` 要遍历
+      // 它的 `.shape`，`plan-lifecycle.e2e-spec.ts` 要 `.parse()` 它，`AppEnv` 类型也从它推。
+      // 在对象上挂 `superRefine` 会把它变成 `ZodEffects`，那三处一起坏掉。
+      //
+      // 于是「生产环境不许用 mock」这条跨字段规则只能读 `process.env.NODE_ENV`。
+      // 这不是取巧：`NODE_ENV` 本来就是进程级事实，`loadEnv(schema, source)` 的
+      // `source` 默认就是 `process.env`，两者在真实启动路径上是同一个值。
+      if (value === 'mock' && process.env.NODE_ENV === 'production') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'GEO_LLM_PROVIDER=mock 在生产环境被禁止：mock 会**编造**一整套看起来完全正常的' +
+            '提及/情感/位次数据，客户拿它开三周会才会发现是假的（与 GEO 引擎侧的 mock 同一个理由，' +
+            '见 geo-engine-registry.provider.ts）。请配成 openai-compatible 或 dashscope。',
+        })
+      }
+    })
+    .describe(
+      'GEO 分析用的 LLM 供应商：mock（默认，仅非生产）/ openai-compatible（DeepSeek、Kimi、智谱、vLLM 通吃）/ dashscope（通义原生）。' +
+        '生产环境（NODE_ENV=production）配 mock 会**拒绝启动**',
+    ),
+
+  GEO_LLM_BASE_URL: z
+    .string()
+    .optional()
+    .describe(
+      'LLM 网关地址。openai-compatible 必填（如 https://api.deepseek.com/v1，后面会拼 /chat/completions）；' +
+        'dashscope 不填走官方 https://dashscope.aliyuncs.com；mock 忽略',
+    ),
+
+  GEO_LLM_API_KEY: z
+    .string()
+    .optional()
+    .describe('LLM API Key。mock 之外的 provider 必填，缺了启动时就拒（见 geo-llm.provider.ts）'),
+
+  GEO_LLM_MODEL: z
+    .string()
+    .optional()
+    .describe(
+      'LLM 模型名，如 deepseek-chat / qwen-plus。mock 之外的 provider 必填；' +
+        '抽取任务对模型要求不高，选便宜且支持 JSON 输出的那一档即可',
+    ),
+
+  // ── 短信（notify/channels.ts 读这三个；生产上线前置） ──
+
+  SMS_PROVIDER: z
+    .enum(SMS_PROVIDER_NAMES)
+    .default('mock')
+    .superRefine((value, ctx) => {
+      // 与 GEO_LLM_PROVIDER 同一道防线、同一个理由见那条注释：对象级 superRefine
+      // 会把 schema 变成 ZodEffects，破坏三处依赖 `.shape` 的地方，所以放字段级。
+      if (value === 'mock' && process.env.NODE_ENV === 'production') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'SMS_PROVIDER=mock 在生产环境被禁止：这是 env schema 这层的第一道防线，' +
+            '@taizan/sms 的 assertMockNotInProd 在装配期是第二道（守的是「有人把这条 superRefine 删了」）。' +
+            '请配成 luosimao。',
+        })
+      }
+    })
+    .describe(
+      '短信厂商：mock（默认，仅非生产）/ luosimao（螺丝帽）。生产环境（NODE_ENV=production）配 mock 会**拒绝启动**',
+    ),
+
+  LUOSIMAO_API_KEY: z
+    .string()
+    .optional()
+    .describe('螺丝帽短信 API Key（控制台「短信 API → 短信 API」）。SMS_PROVIDER=luosimao 时必填'),
+
+  LUOSIMAO_SIGN: z
+    .string()
+    .optional()
+    .describe(
+      '螺丝帽短信签名（不带【】）。发出的正文若尚未包含这个签名会在**末尾**自动补一次' +
+        '（官方要求签名在内容末尾），已包含则不重复拼接',
+    ),
+
+  // ── 人机验证（螺丝帽 Captcha；只挂在商家/平台登录接口，生产上线前置） ──
+
+  LUOSIMAO_CAPTCHA_SITE_KEY: z
+    .string()
+    .optional()
+    .describe(
+      '螺丝帽人机验证 site_key（前端公开使用，渲染验证码挑战）。' +
+        '**注意**：目前只接了后端校验能力，admin/platform 登录页还没有接入验证码组件本身，' +
+        '这个 key 暂时没有前端在用它',
+    ),
+
+  LUOSIMAO_CAPTCHA_API_KEY: z
+    .string()
+    .optional()
+    .describe(
+      '螺丝帽人机验证 api_key（后端保密，校验 site_verify 用）。LUOSIMAO_CAPTCHA_REQUIRED=true 时必填',
+    ),
+
+  LUOSIMAO_CAPTCHA_REQUIRED: envBoolean(false).describe(
+    '是否强制校验人机验证（`@RequireCaptcha()` 挂的接口目前是商家/平台登录）。' +
+      '**默认 false，且线上暂时不建议打开**——前端登录页还没有接入螺丝帽验证码组件、' +
+      '不会提交 captchaToken，打开这个开关会让登录接口对所有人 400。等前端接入后再打开',
+  ),
+} as const
+
+/**
+ * 完整的应用 env schema = 框架基线 + 计费片段 + 基础设施片段 + 本应用字段。
+ *
+ * ## 为什么要显式合 `BILLING_ENV_SHAPE` / `INFRA_ENV_SHAPE`
+ *
+ * 两个包各自导出「我读哪些环境变量」的 zod 片段，而不是去改 `BASE_ENV_SCHEMA`
+ * （那是 `@taizan/nest-core` 的契约，包不该互改）。装配方（也就是这个文件）
+ * 负责把用到的包的片段合进来——**合了才会被启动期校验、才会出现在 `.env.example` 里**。
+ * 漏合的后果是：`CRON_ENABLED=ture` 这种拼写错误不再拒启，而是被
+ * `readEnvBoolean` 在第一次用到时才抛，或者更糟——静默变成 false，定时任务全不跑。
+ *
+ * 顺序：`BILLING_ENV_SHAPE.BILLING_ENFORCE` 与 `BASE_ENV_SCHEMA` 里那份是**同形状副本**
+ * （nest-billing 的 `env.ts` 里写了理由），后写覆盖先写，覆盖无害。
+ * `APP_ENV_SHAPE` 放最后：本应用自己的字段有最终解释权。
+ */
+export const APP_ENV_SCHEMA = defineEnvSchema(BASE_ENV_SCHEMA, {
+  ...BILLING_ENV_SHAPE,
+  ...INFRA_ENV_SHAPE,
+  ...APP_ENV_SHAPE,
+})
+
+/** 校验通过后的 env 类型。`ConfigService<AppEnv>` 用它拿字段提示。 */
+export type AppEnv = z.infer<typeof APP_ENV_SCHEMA>
+
+/**
+ * 本应用自己的 dev 后门开关清单。
+ *
+ * 形状照抄 `@taizan/nest-core` 的 `FORBIDDEN_DEV_FLAGS`——那个常量是框架级的、
+ * 只列框架自己认识的开关（短信验证码回传、微信假登录），业务项目新增的后门它管不到。
+ * 与其去改框架包，不如在应用侧再挂一份同形状的清单 + 一次断言。
+ */
+export const APP_FORBIDDEN_DEV_FLAGS: ReadonlyArray<{ key: string; consequence: string }> = [
+  {
+    key: 'CLIENT_DEV_LOGIN',
+    consequence: '只凭手机号就能拿到任意会员的 token → 任意人可冒充任意会员',
+  },
+  {
+    key: 'PAY_FAKE_ENABLED',
+    consequence:
+      'FakeProvider 的签名 secret 是包里写死的常量 → 任何人都能构造一份验得过签的「已付款」回调，' +
+      '白嫖任意租户的套餐续期（钱一分没收，权益照发）',
+  },
+]
+
+/** {@link assertAppDevFlagsInProd} 检测到违规时抛出。 */
+export class AppDevFlagInProductionError extends Error {
+  override readonly name = 'AppDevFlagInProductionError'
+  constructor(readonly violations: readonly string[]) {
+    super(
+      '安全保护：生产环境（NODE_ENV=production）禁止开启以下开关，请移除后再启动：' +
+        violations.map((v) => `\n  - ${v}`).join(''),
+    )
+  }
+}
+
+function isTruthyFlag(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string')
+    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase())
+  return false
+}
+
+/**
+ * 生产环境开着应用级后门就拒绝启动。
+ *
+ * 由 `main.ts` 在 `NestFactory.create` 之前显式调一次。框架的
+ * `assertNoDevCodeInProd` 由 `CoreModule.forRoot()` 自动调，两者并列不合并。
+ *
+ * @param env - 已校验的 env（也接受裸 `process.env`）
+ * @throws {@link AppDevFlagInProductionError}
+ */
+export function assertAppDevFlagsInProd(env: Record<string, unknown>): void {
+  if (env.NODE_ENV !== 'production') return
+  const violations = APP_FORBIDDEN_DEV_FLAGS.filter((flag) => isTruthyFlag(env[flag.key])).map(
+    (flag) => `${flag.key}=${String(env[flag.key])}（${flag.consequence}）`,
+  )
+  if (violations.length > 0) throw new AppDevFlagInProductionError(violations)
+}

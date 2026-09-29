@@ -1,0 +1,33 @@
+{
+  "id": "as-mock-ernie-0001",
+  "object": "chat.completion",
+  "created": 1789000000,
+  "model": "ernie-4.5-turbo-128k",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "常见的 GEO 监测工具包括泰赞GEO、新榜智汇等。"
+      },
+      "finish_reason": "normal"
+    }
+  ],
+  "search_results": [
+    {
+      "index": 1,
+      "url": "https://www.example.org/geo",
+      "title": "泰赞 GEO：生成式引擎优化监测"
+    },
+    {
+      "index": 2,
+      "url": "https://geo.newrank.cn/",
+      "title": "新榜智汇"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 96,
+    "completion_tokens": 210,
+    "total_tokens": 306
+  }
+}

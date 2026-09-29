@@ -1,0 +1,41 @@
+{
+  "id": "chatcmpl-mock-0001",
+  "object": "chat.completion",
+  "created": 1789000005,
+  "model": "gpt-4.1-mini",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Popular GEO monitoring tools include Taizan GEO and Newrank Zhihui.",
+        "annotations": [
+          {
+            "type": "url_citation",
+            "url_citation": {
+              "start_index": 41,
+              "end_index": 52,
+              "url": "https://www.example.org/geo?utm_source=openai",
+              "title": "Taizan GEO"
+            }
+          },
+          {
+            "type": "url_citation",
+            "url_citation": {
+              "start_index": 57,
+              "end_index": 73,
+              "url": "https://geo.newrank.cn/",
+              "title": "Newrank Zhihui"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 64,
+    "completion_tokens": 120,
+    "total_tokens": 184
+  }
+}

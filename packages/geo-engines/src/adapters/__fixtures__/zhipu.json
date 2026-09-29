@@ -1,0 +1,41 @@
+{
+  "id": "mock-zhipu-0001",
+  "created": 1789000003,
+  "model": "glm-4-plus",
+  "request_id": "mock-req-zhipu-1",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "国内的 GEO 监测工具有泰赞GEO、新榜智汇等，前者支持六个国产引擎。"
+      }
+    }
+  ],
+  "web_search": [
+    {
+      "title": "泰赞 GEO 官网",
+      "link": "https://www.example.org/geo/",
+      "content": "泰赞 GEO 支持通义、文心、混元、智谱、秘塔、豆包六个引擎的可见度监测。",
+      "media": "泰赞",
+      "icon": "https://sfile.chatglm.cn/mock.png",
+      "publish_date": "2026-08-01",
+      "refer": "ref_1"
+    },
+    {
+      "title": "新榜智汇",
+      "link": "https://geo.newrank.cn/",
+      "content": "新榜出品的 GEO 监测产品。",
+      "media": "新榜",
+      "icon": "",
+      "publish_date": "2026-07-20",
+      "refer": "ref_2"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 101,
+    "completion_tokens": 188,
+    "total_tokens": 289
+  }
+}

@@ -1,0 +1,163 @@
+import { Descriptions, Drawer, Empty, Spin, Table, Tag, Typography } from 'antd'
+import {
+  GEO_RESULT_STATUS,
+  GEO_SENTIMENT,
+  GEO_SOURCE_CATEGORY_TEXT,
+  type GeoCitation,
+  type GeoMention,
+  type GeoResultDetail,
+} from '../../api/geo-result'
+
+/**
+ * 一条回答的只读详情抽屉：原文 + 提及 + 引用。
+ *
+ * ## 为什么是抽屉而不是一个独立页面
+ *
+ * 运营在这一页做的事是「一条条扫过去看 AI 到底怎么说的」。独立页面意味着每看一条
+ * 都要跳走再跳回来，而列表的分页/筛选状态在往返之间很容易丢。
+ *
+ * ## 为什么是三段而不是一段
+ *
+ * 原文回答「AI 说了什么」，提及回答「我们被算成第几」，引用回答「它是从哪读到的」。
+ * 第三段是这个产品最值钱的部分——知道 AI 引的是知乎那篇帖子，才知道下一步该去哪发内容。
+ *
+ * 这是 T6 的**占位形态**（一个 Descriptions + 两张小表），T8 会按设计文档 §6.1 美化。
+ */
+export function GeoResultDetailDrawer({
+  detail,
+  loading,
+  open,
+  onClose,
+}: {
+  /** 正在看哪一条；`null` 时不渲染内容（抽屉关闭动画期间会是这个状态）。 */
+  detail: GeoResultDetail | null
+  loading: boolean
+  open: boolean
+  onClose: () => void
+}) {
+  return (
+    <Drawer title="回答详情" width={840} open={open} onClose={onClose} destroyOnClose>
+      {loading ? (
+        <Spin />
+      ) : detail === null ? (
+        <Empty description="没有取到这条回答" />
+      ) : (
+        <>
+          <Descriptions size="small" column={2} bordered style=\{{ marginBottom: 16 }}>
+            <Descriptions.Item label="引擎">{detail.engineCode}</Descriptions.Item>
+            <Descriptions.Item label="模型">{detail.model || '-'}</Descriptions.Item>
+            <Descriptions.Item label="状态">
+              <Tag color={GEO_RESULT_STATUS[detail.status].color}>
+                {GEO_RESULT_STATUS[detail.status].text}
+              </Tag>
+            </Descriptions.Item>
+            <Descriptions.Item label="采样序号">{detail.sampleIndex}</Descriptions.Item>
+            <Descriptions.Item label="耗时">{detail.latencyMs} ms</Descriptions.Item>
+            <Descriptions.Item label="成本">
+              ¥{(detail.costCents / 100).toFixed(4)}
+            </Descriptions.Item>
+            <Descriptions.Item label="token">
+              入 {detail.inputTokens} / 出 {detail.outputTokens}
+            </Descriptions.Item>
+            <Descriptions.Item label="联网搜索">{detail.searchCalls} 次</Descriptions.Item>
+            {detail.errorKind ? (
+              <Descriptions.Item label="失败原因" span={2}>
+                <Typography.Text type="danger">
+                  {detail.errorKind}：{detail.errorMessage ?? ''}
+                </Typography.Text>
+              </Descriptions.Item>
+            ) : null}
+          </Descriptions>
+
+          <Typography.Title level={5}>回答原文</Typography.Title>
+          <Typography.Paragraph
+            style=\{{
+              whiteSpace: 'pre-wrap',
+              background: 'rgba(0,0,0,0.03)',
+              padding: '12px 16px',
+              borderRadius: 4,
+              maxHeight: 320,
+              overflow: 'auto',
+            }}
+          >
+            {detail.rawText ?? '（没有正文）'}
+            {detail.rawTruncated ? (
+              <Typography.Text type="secondary">（原文过长，已截断）</Typography.Text>
+            ) : null}
+          </Typography.Paragraph>
+
+          <Typography.Title level={5}>提及（{detail.mentions.length}）</Typography.Title>
+          <Table<GeoMention>
+            size="small"
+            rowKey="id"
+            pagination={false}
+            dataSource={detail.mentions}
+            locale=\{{ emptyText: '这条回答里一个实体都没提到' }}
+            columns={[
+              { title: '位次', dataIndex: 'position', key: 'position', width: 60 },
+              { title: '实体', dataIndex: 'entityName', key: 'entityName', width: 160 },
+              {
+                title: '类型',
+                key: 'entityKind',
+                width: 80,
+                render: (_v: unknown, row: GeoMention) =>
+                  row.entityKind === 'BRAND' ? <Tag color="blue">本品牌</Tag> : <Tag>竞品</Tag>,
+              },
+              {
+                title: '情感',
+                key: 'sentiment',
+                width: 110,
+                render: (_v: unknown, row: GeoMention) => (
+                  <Tag color={GEO_SENTIMENT[row.sentiment].color}>
+                    {GEO_SENTIMENT[row.sentiment].text} {row.sentimentScore}
+                  </Tag>
+                ),
+              },
+              {
+                title: '被引用',
+                key: 'isCited',
+                width: 80,
+                render: (_v: unknown, row: GeoMention) => (row.isCited ? '是' : '否'),
+              },
+              { title: '片段', dataIndex: 'snippet', key: 'snippet', ellipsis: true },
+            ]}
+          />
+
+          <Typography.Title level={5} style=\{{ marginTop: 16 }}>
+            引用（{detail.citations.length}）
+          </Typography.Title>
+          <Table<GeoCitation>
+            size="small"
+            rowKey="id"
+            pagination={false}
+            dataSource={detail.citations}
+            locale=\{{ emptyText: '这条回答没有带出任何引用' }}
+            columns={[
+              { title: '#', dataIndex: 'rank', key: 'rank', width: 50 },
+              { title: '域名', dataIndex: 'domain', key: 'domain', width: 200 },
+              {
+                title: '归类',
+                key: 'category',
+                width: 110,
+                render: (_v: unknown, row: GeoCitation) =>
+                  GEO_SOURCE_CATEGORY_TEXT[row.category] ?? row.category,
+              },
+              {
+                title: '链接',
+                key: 'url',
+                ellipsis: true,
+                render: (_v: unknown, row: GeoCitation) => (
+                  // `rel="noreferrer"`：这些 URL 来自第三方回答，不该把本后台的地址
+                  // 当 referer 带出去。
+                  <a href={row.url} target="_blank" rel="noreferrer">
+                    {row.title ?? row.url}
+                  </a>
+                ),
+              },
+            ]}
+          />
+        </>
+      )}
+    </Drawer>
+  )
+}

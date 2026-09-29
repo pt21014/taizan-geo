@@ -1,0 +1,923 @@
+/**
+ * `pnpm -F @taizan/api seed` —— 把一个空库变成「能登进三套后台、能看到数据」的状态。
+ *
+ * `pnpm -F @taizan/api seed --prod`（`package.json` 里是 `seed:prod`）—— 生产初始化专用：
+ * 只建系统基线（平台管理员随机口令 + 两档套餐 + 角色模板 + GEO 系统配置 + RBAC 镜像），
+ * **不建任何演示租户/演示数据**。见文件末尾 `runProd()`。
+ *
+ * ## 产出（本地开发 / `pnpm seed`）
+ *
+ * | 身份 | 登录名 | 口令 | 入口 |
+ * |---|---|---|---|
+ * | 平台超管 | `admin` | `admin123` | `POST /api/platform/auth/login` |
+ * | 演示店 A 店主 | `13800000000` | `123456` | `POST /api/admin/auth/login` |
+ * | 演示店 B 店主 | `13800000001` | `123456` | 同上 |
+ *
+ * 另外：两档套餐、内置角色模板、A 店 3 个商品、B 店 2 个商品。
+ *
+ * **两家店是刻意的**：只有一家店的库测不出隔离——任何漏掉租户条件的查询在单租户库上
+ * 都是绿的。有了 B 店，`pnpm test:e2e` 才能断言「A 的 token 只看得见 A 的 3 个商品」。
+ *
+ * ## 三条约定（继承自 `@taizan/prisma-base` 的 `seedBase`）
+ *
+ * 1. **全程 upsert，重复跑不出事**；
+ * 2. **不重置已有账号的口令**——seed 要是能改密码，它就是个后门；
+ * 3. 用**原始** `PrismaClient`（不套租户隔离扩展）：seed 要跨租户造数，
+ *    隔离扩展在没有租户上下文时会正确地抛错。
+ *
+ * @packageDocumentation
+ */
+
+import 'dotenv/config'
+
+import { randomBytes } from 'node:crypto'
+
+import { Prisma, PrismaClient } from '@prisma/client'
+import { ulid } from '@taizan/contracts'
+import { createVault } from '@taizan/crypto'
+import { MenuRegistry, PermissionRegistry, RbacSyncService } from '@taizan/nest-rbac'
+import {
+  DEFAULT_ADMIN_PASSWORD,
+  DEFAULT_ADMIN_USERNAME,
+  DEMO_OWNER_PASSWORD,
+  hashPassword,
+  OWNER_ROLE_CODE,
+  seedBase,
+  seedDemoTenant,
+  type SeedContext,
+} from '@taizan/prisma-base'
+
+import { ALL_MENUS } from './registry/menus'
+import { PERMISSIONS } from './registry/permissions'
+import { FEATURES } from './registry/features'
+import { findFirstUpsertDelegate } from './seed-delegates'
+import { hashPromptText } from './modules/geo/prompt/geo-prompt.rules'
+
+/** 第二家演示店：隔离测试的对照组。 */
+const SHOP_B = {
+  slug: 'demo-b',
+  name: '演示商家 B',
+  ownerPhone: '13800000001',
+  ownerName: 'B 店店主',
+} as const
+
+/** A 店的商品。 */
+const GOODS_A = [
+  { name: '可乐 330ml', priceCents: 350, stock: 100, status: 'ON_SHELF' as const },
+  { name: '雪碧 330ml', priceCents: 350, stock: 80, status: 'ON_SHELF' as const },
+  { name: '气泡水（新品待发布）', priceCents: 500, stock: 0, status: 'DRAFT' as const },
+]
+
+/** B 店的商品。名字**故意和 A 店重一个**——唯一索引是 `[tenantId, name, deletedAt]`， */
+/** 两家店可以有同名商品，这条 seed 数据就是那个约定的活体样本。 */
+const GOODS_B = [
+  { name: '可乐 330ml', priceCents: 400, stock: 50, status: 'ON_SHELF' as const },
+  { name: 'B 店限定咖啡', priceCents: 1800, stock: 20, status: 'ON_SHELF' as const },
+]
+
+// raw-reason: seed 要跨租户造数（平台管理员、套餐、两家演示租户），
+// 隔离扩展在没有租户上下文时会正确地抛错。这里必须用未叠加扩展的原始 client。
+const prisma = new PrismaClient()
+
+/**
+ * A 店里那个「只看得到商品列表」的角色。
+ *
+ * 它存在的理由是**证明权限点真的在拦**：只有店主一个人的库测不出 RBAC——
+ * 店主 `isOwner` 恒等于全部权限，无论 `PermissionsGuard` 装没装上，行为都一样。
+ * 有了这个角色，`rbac-billing.e2e-spec.ts` 才能断言「他 GET 得到、POST 是 1340300」。
+ */
+const VIEWER_ROLE = { code: 'goods-viewer', name: '商品查看员' } as const
+
+/**
+ * A 店里挂那个角色的员工。
+ *
+ * **不复用 `13800000001`**——那是 B 店店主的登录账号（`StaffAccount.phone` 全局唯一），
+ * 把它同时挂成 A 店的员工会让 B 店店主登录时进入「一号多店，请选店」分支，
+ * 于是 README 里写的那条 B 店登录示例就不成立了。多用一个号码比改文档便宜。
+ */
+const VIEWER_STAFF = { phone: '13800000002', name: 'A 店商品查看员' } as const
+
+/**
+ * A 店里那张**没人用过的**员工邀请（T1-9）。
+ *
+ * 它存在的理由和 `VIEWER_STAFF` 一样：**证明那条路真的通**。邀请的核销端在
+ * `/api/public/invites/:token/accept`，免登录、免租户——没有一张现成的邀请，
+ * 开发者要先登进后台点一次「邀请员工」才能试那条路，而那正好是最容易被跳过的一步。
+ *
+ * `token` 写死成一个人类可读的串（不是随机串）：seed 的产出说明里要能直接打印出
+ * 完整链接，让人复制到浏览器里就能试。**真实邀请的 token 是 24 字节随机数**
+ * （见 `admin/staff/staff.service.ts`），这里的可读串只是开发夹具。
+ */
+const DEMO_INVITE = {
+  token: 'demo-staff-invite-token',
+  /** 不限手机号：任何人凭链接可入，方便本地随便编一个号试。 */
+  phone: null,
+  expiresInDays: 3650,
+} as const
+
+/**
+ * 一条面向全平台的演示公告（T1-9）。
+ *
+ * 商家侧的 `GET /api/admin/announcements` 只看得到「已发布 + 在有效期内 + audience
+ * 命中本店」的公告，三个条件缺一条都是空列表——而空列表和「接口坏了」长得一模一样。
+ * 所以 seed 里必须有一条**一定看得见**的：`ALL_TENANT` + `PUBLISHED` + 无过期时间。
+ *
+ * `id` 写死是为了幂等：`Announcement` 上除了主键没有别的唯一键（它没有自然键——
+ * 同一个标题发两次是正常需求），所以 upsert 只能按 id。这个值是一个形状合法的
+ * ULID 字面量，不是随机生成的。
+ */
+const DEMO_ANNOUNCEMENT = {
+  id: '01JZZZSEEDANN0000000000001',
+  title: '欢迎使用 taizan-saas 演示环境',
+  contentHtml:
+    '<p>这条公告由 <code>pnpm -F @taizan/api seed</code> 写入，audience = ALL_TENANT，' +
+    '所以每一家演示店都看得到它。</p>' +
+    '<p>点「标记已读」会往 <code>AnnouncementRead</code> 写一条回执，' +
+    '刷新之后这一行就变成已读状态。</p>',
+} as const
+
+/**
+ * 体验版套餐要开的功能项。
+ *
+ * **这不是演示数据**——`Plan` 是全租户共享的套餐行，这里写的是**真实体验版套餐**的
+ * `features`，生产环境的真实商家开体验版账号照样要靠这份数据才能用商品/GEO 功能。
+ * 所以它和 `seedGeoPlanQuotas`/`seedGeoEngines`/`seedGeoSourceRules` 一样属于
+ * `seedSystemConfig`，生产基线 seed（`runProd`）也要跑。
+ *
+ * `@taizan/prisma-base` 的内置套餐给的是 `['member', 'order']`——那是框架举的例子，
+ * 与**本应用**的功能项注册表（`src/registry/features.ts` 里只有 `goods`）对不上。
+ * 不修的话，商家一建商品就是 `1540302`「当前套餐不包含商品模块」。
+ *
+ * 所以 seed 完框架基线之后，按本应用的注册表把体验版的 features 补齐。
+ * 保留框架那两个 key 是无害的：`checkFeatureAccess` 只按注册表里的 `pathPrefixes` 匹配，
+ * 认不出的 key 不影响任何路径。
+ */
+const TRIAL_PLAN_FEATURES: readonly string[] = [
+  'member',
+  'order',
+  // `geo.daily_refresh` 是权益位而不是路由前缀（技术设计 §4.1），`registry/features.ts`
+  // 刻意没有把它注册成 FeatureDef——注册了就得凑一条假路由去满足 spec 8「每个功能项
+  // 都要有真实控制器兑现」的约束。它作为一个「认不出但无害」的 key 直接写进 features
+  // 数组：`checkFeatureAccess` 只认注册表里的 pathPrefixes，这个 key 不拦任何路径，
+  // 纯粹是给前端「这档套餐含日频刷新」这句话一个可读的数据来源。
+  'geo.daily_refresh',
+  ...FEATURES.map((f) => f.key),
+]
+
+/**
+ * GEO 业务维度的套餐配额（T8，技术设计 §8 第 1 条）。
+ *
+ * 只加 GEO_* 五个 key，不动 STAFF/STORE/MEMBER/STORAGE_MB/TRAFFIC_MB 这些框架维度——
+ * `seedGeoPlanQuotas` 会先读出当前 `Plan.quotas`（框架 seed 刚写完的那份）再合并，
+ * 不是整份覆盖，否则这里一写，`STAFF` 之类的框架配额就被静默清空了。
+ */
+const GEO_PLAN_QUOTAS: Record<string, Record<string, number | null>> = {
+  trial: {
+    GEO_BRAND: 1,
+    GEO_PROMPT: 20,
+    GEO_ENGINE: 2,
+    GEO_QUERY_MONTHLY: 200,
+    GEO_CONTENT_MONTHLY: 0,
+  },
+  standard: {
+    GEO_BRAND: 5,
+    GEO_PROMPT: 200,
+    GEO_ENGINE: 6,
+    GEO_QUERY_MONTHLY: 5000,
+    GEO_CONTENT_MONTHLY: 50,
+  },
+}
+
+/** 幂等地给某家店塞商品：已有同名（未软删）的就更新，没有就建。 */
+async function seedGoods(
+  tenantId: string,
+  items: readonly {
+    name: string
+    priceCents: number
+    stock: number
+    status: 'DRAFT' | 'ON_SHELF' | 'OFF_SHELF'
+  }[],
+): Promise<number> {
+  let created = 0
+  for (const item of items) {
+    // 原始 client 没有 ULID 扩展也没有租户注入，所以 id 与 tenantId 都要自己写。
+    // 这是 seed 独有的待遇；业务代码里写这两个字段中的任何一个都是错的。
+    const existing = await prisma.goods.findFirst({
+      where: { tenantId, name: item.name, deletedAt: null },
+      select: { id: true },
+    })
+    if (existing) {
+      await prisma.goods.update({ where: { id: existing.id }, data: { ...item } })
+    } else {
+      await prisma.goods.create({ data: { id: ulid(), tenantId, ...item } })
+      created += 1
+    }
+  }
+  return created
+}
+
+/**
+ * 平台域的 GEO 引擎接入点（T5）。
+ *
+ * ## 为什么 mock 是**唯一**默认启用的那个
+ *
+ * 真引擎（qwen / ernie）没有密钥就一条查询都跑不成，默认启用的后果是每次跑批
+ * 都以一堆 AUTH 失败告终，而那看起来和「代码坏了」一模一样。它们在这里只是
+ * **占位**：平台运营进后台看到这一行，知道"接这家要填什么"，填完密钥再打开开关。
+ *
+ * mock 反过来：它不需要密钥、不花钱、输出确定，是「装完能不能跑通一次」的
+ * 最小证据。`assertMockNotInProd` 与 registry 的装配（`geo-engine-registry.provider.ts`）
+ * 保证它在 `NODE_ENV=production` 下连注册都不会发生。
+ *
+ * ## 单价的来源
+ *
+ * 通义那两个 token 单价是按《GEO-功能需求调研报告》的粗估填的（输入 0.8 元 /
+ * 百万 token、输出 2 元 / 百万 token 折成 80 / 200 分），`pricePerQueryCents: 1`
+ * 是联网检索的按次估价。**它们是估值不是合同价**——上线前必须按真实合同改一遍。
+ * 这里填非零值是为了让「成本这一列不是 0」在演示数据里就成立：全填 0 的话
+ * `GeoUsageLedger.costCents` 恒等于 0，而那会让费用页看起来"好像是对的"。
+ */
+const GEO_ENGINES = [
+  {
+    code: 'mock',
+    name: 'Mock（联调用）',
+    vendor: 'taizan',
+    accessType: 'API' as const,
+    enabled: true,
+    model: 'mock-engine-v1',
+    baseUrl: null,
+    /** 整包凭据的明文。mock 适配器只认 `scenario`（默认 `mention`）。 */
+    credentials: { scenario: 'mention' } as Record<string, string> | null,
+    pricePerQueryCents: 0,
+    priceInPerMTokenCents: 0,
+    priceOutPerMTokenCents: 0,
+    // 600 = 每秒 10 次。mock 不发请求，限速对它唯一的意义是「别让限速器成为瓶颈」。
+    rateLimitPerMin: 600,
+    timeoutMs: 5000,
+    sort: 0,
+  },
+  {
+    code: 'qwen',
+    name: '通义千问',
+    vendor: 'aliyun',
+    accessType: 'API' as const,
+    enabled: false,
+    model: 'qwen-plus',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    credentials: null as Record<string, string> | null,
+    pricePerQueryCents: 1,
+    priceInPerMTokenCents: 80,
+    priceOutPerMTokenCents: 200,
+    rateLimitPerMin: 60,
+    timeoutMs: 60_000,
+    sort: 10,
+  },
+  {
+    code: 'ernie',
+    name: '文心一言',
+    vendor: 'baidu',
+    accessType: 'API' as const,
+    enabled: false,
+    // 千帆的模型名随接入点走，留空让适配器用自己的默认值。
+    model: '',
+    baseUrl: null,
+    credentials: null as Record<string, string> | null,
+    pricePerQueryCents: 0,
+    priceInPerMTokenCents: 0,
+    priceOutPerMTokenCents: 0,
+    rateLimitPerMin: 60,
+    timeoutMs: 60_000,
+    sort: 20,
+  },
+]
+
+/**
+ * 引用来源 → 平台标识 + 归类的规则（T5，技术设计 §8 第 3 条）。
+ *
+ * ## `priority` 怎么定
+ *
+ * 大的先匹配。**子域名规则必须高于它的父域名**：`baike.baidu.com` 是百科
+ * （ENCYCLOPEDIA）、`tieba.baidu.com` 是社区（SOCIAL），而将来若有人加一条
+ * `baidu.com` 的兜底规则，它不能把这几条盖掉。所以三段域名给 100、两段给 50。
+ *
+ * ## 为什么没有 OWNED / COMPETITOR 两类
+ *
+ * 那两类不看这张表，看的是**这个品牌自己的** `domain` 与竞品的 `domain`
+ * （`classifySource(domain, rules, brandDomain, competitorDomains)`，技术设计 §4.4）。
+ * 同一个 `example.org` 对 A 租户是自有阵地、对 B 租户就是第三方——把它写进
+ * 全平台共享的规则表里从一开始就是错的。
+ */
+const GEO_SOURCE_RULES = [
+  { pattern: 'zhihu.com', platform: 'ZHIHU', category: 'SOCIAL' as const, priority: 50 },
+  {
+    pattern: 'baike.baidu.com',
+    platform: 'BAIDU_BAIKE',
+    category: 'ENCYCLOPEDIA' as const,
+    priority: 100,
+  },
+  { pattern: 'xiaohongshu.com', platform: 'XHS', category: 'SOCIAL' as const, priority: 50 },
+  { pattern: 'mp.weixin.qq.com', platform: 'WECHAT', category: 'SOCIAL' as const, priority: 100 },
+  { pattern: '36kr.com', platform: 'MEDIA', category: 'PR' as const, priority: 50 },
+  {
+    pattern: 'baijiahao.baidu.com',
+    platform: 'BAIJIAHAO',
+    category: 'EARNED' as const,
+    priority: 100,
+  },
+  { pattern: 'bilibili.com', platform: 'BILIBILI', category: 'SOCIAL' as const, priority: 50 },
+  { pattern: 'douyin.com', platform: 'DOUYIN', category: 'SOCIAL' as const, priority: 50 },
+  { pattern: 'sohu.com', platform: 'SOHU', category: 'EARNED' as const, priority: 50 },
+  { pattern: 'csdn.net', platform: 'CSDN', category: 'EARNED' as const, priority: 50 },
+  { pattern: 'jianshu.com', platform: 'JIANSHU', category: 'SOCIAL' as const, priority: 50 },
+  { pattern: 'weibo.com', platform: 'WEIBO', category: 'SOCIAL' as const, priority: 50 },
+  { pattern: 'tieba.baidu.com', platform: 'TIEBA', category: 'SOCIAL' as const, priority: 100 },
+  { pattern: 'zhidao.baidu.com', platform: 'ZHIDAO', category: 'SOCIAL' as const, priority: 100 },
+  {
+    pattern: 'wikipedia.org',
+    platform: 'WIKIPEDIA',
+    category: 'ENCYCLOPEDIA' as const,
+    priority: 50,
+  },
+]
+
+/**
+ * 幂等地塞 `GeoEngine`。
+ *
+ * ## 已有行**不碰** `enabled` 与凭据
+ *
+ * 这是和 `seedGoods` 最大的区别，理由与 `seedBase` 那条「不重置已有账号的口令」
+ * 一模一样：平台运营在后台填过真密钥、打开过开关之后，再跑一次 seed 不能把它
+ * 覆盖回去——那等于 seed 是一个「把生产密钥删掉」的按钮。
+ *
+ * 顺带解决幂等：`vault.encrypt` 每次的 IV 都不同，同一份明文加密两次得到两串
+ * 不同的密文。只在**新建**时加密，跑第二遍就不会有任何凭据写入。
+ */
+async function seedGeoEngines(): Promise<number> {
+  const vault = createVault({
+    keys: JSON.parse(process.env.CRYPTO_KEYS ?? '{}') as Record<string, string>,
+    currentKeyId: process.env.CRYPTO_KEY_CURRENT ?? 'k1',
+  })
+
+  let created = 0
+  for (const engine of GEO_ENGINES) {
+    const { code, credentials, ...rest } = engine
+    const existing = await prisma.geoEngine.findUnique({ where: { code }, select: { id: true } })
+    if (existing) {
+      // 只同步「描述性」字段：名称、厂商、模型、地址、单价、限速、超时、排序。
+      const { enabled: _enabled, ...describable } = rest
+      await prisma.geoEngine.update({ where: { id: existing.id }, data: describable })
+      continue
+    }
+
+    await prisma.geoEngine.create({
+      data: { id: ulid(), code, ...rest, config: {}, ...encryptCredentials(vault, credentials) },
+    })
+    created += 1
+  }
+  return created
+}
+
+/** 整包凭据 → 三列（密文 / keyId / 脱敏提示）。`null` 表示这个引擎还没配密钥。 */
+function encryptCredentials(
+  vault: ReturnType<typeof createVault>,
+  credentials: Record<string, string> | null,
+): { credentialEnc: string | null; credentialKeyId: string | null; credentialMasked: string | null } {
+  if (credentials === null) {
+    return { credentialEnc: null, credentialKeyId: null, credentialMasked: null }
+  }
+  const { valueEnc, keyId } = vault.encrypt(JSON.stringify(credentials))
+  return {
+    credentialEnc: valueEnc,
+    credentialKeyId: keyId,
+    // 脱敏口径与 `modules/geo/engine/geo-engine.rules.ts` 的 `maskCredentials` 一致
+    // （前 3 后 2、中间固定 6 个星、短值整串打星）。这里手写而不是 import：
+    // seed 是一个独立跑的脚本，把它接进 apps/api 的模块图会让它连带加载 Nest 那一侧。
+    credentialMasked: JSON.stringify(
+      Object.fromEntries(
+        Object.entries(credentials).map(([k, v]) => [
+          k,
+          v.length <= 5 ? '******' : `${v.slice(0, 3)}******${v.slice(-2)}`,
+        ]),
+      ),
+    ),
+  }
+}
+
+/** 幂等地塞 `GeoSourcePlatformRule`。`pattern` 是全局唯一键。 */
+async function seedGeoSourceRules(): Promise<number> {
+  let created = 0
+  for (const rule of GEO_SOURCE_RULES) {
+    const existing = await prisma.geoSourcePlatformRule.findUnique({
+      where: { pattern: rule.pattern },
+      select: { id: true },
+    })
+    if (existing) {
+      await prisma.geoSourcePlatformRule.update({ where: { id: existing.id }, data: rule })
+    } else {
+      await prisma.geoSourcePlatformRule.create({ data: { id: ulid(), ...rule } })
+      created += 1
+    }
+  }
+  return created
+}
+
+/** demo 品牌「钛赞云」（T8，技术设计 §8 第 4 条）。 */
+const GEO_DEMO_BRAND = {
+  name: '钛赞云',
+  domain: 'taizan.example.com',
+  aliases: ['钛赞', 'Taizan'],
+  engineCodes: ['mock'],
+  sampleSize: 3,
+} as const
+
+/** 「钛赞云」的两个对照竞品，只用来在解析回答时一起识别份额，不单独跑批。 */
+const GEO_DEMO_COMPETITORS = [
+  { name: '云势科技', domain: 'yunshi-tech.example.com', aliases: ['云势'] },
+  { name: '致远智能', domain: 'zhiyuan-ai.example.com', aliases: ['致远'] },
+] as const
+
+const GEO_DEMO_PROMPT_SET_NAME = '核心问法'
+
+/** 覆盖认知 / 比较 / 决策三个漏斗阶段，demo 数据顺带演示 `funnelStage` 怎么分组。 */
+const GEO_DEMO_PROMPTS = [
+  { text: '钛赞云是做什么的？', topic: '品牌认知', funnelStage: 'TOFU' as const },
+  { text: '钛赞云支持哪些 AI 引擎？', topic: '功能', funnelStage: 'TOFU' as const },
+  { text: '钛赞云和云势科技哪个更好？', topic: '竞品对比', funnelStage: 'MOFU' as const },
+  { text: '钛赞云的 GEO 监测服务怎么收费？', topic: '价格', funnelStage: 'BOFU' as const },
+  { text: '钛赞云靠谱吗？有没有真实案例？', topic: '信任背书', funnelStage: 'BOFU' as const },
+] as const
+
+/** 幂等地把 GEO_PLAN_QUOTAS 合并进某个套餐已有的 `quotas`（不覆盖框架维度）。 */
+async function seedGeoPlanQuotas(planId: string, planCode: string): Promise<void> {
+  const extra = GEO_PLAN_QUOTAS[planCode]
+  if (!extra) return
+  const plan = await prisma.plan.findUniqueOrThrow({ where: { id: planId }, select: { quotas: true } })
+  const current = (plan.quotas ?? {}) as Record<string, number | null>
+  await prisma.plan.update({
+    where: { id: planId },
+    data: { quotas: { ...current, ...extra } },
+  })
+}
+
+/**
+ * 幂等地塞 demo 品牌「钛赞云」+ 竞品 + Prompt 集合 + Prompt + 告警规则（T8，技术设计 §8 第 4 条）。
+ *
+ * 只挂在 A 店（`demoA`）下：B 店的演示价值是「到期只读」的对照组（见 `expireTenant`），
+ * 不需要再背一份 GEO 数据。
+ */
+async function seedGeoDemoData(
+  tenantId: string,
+): Promise<{ brandId: string; competitors: number; prompts: number }> {
+  const existingBrand = await prisma.geoBrand.findFirst({
+    where: { tenantId, name: GEO_DEMO_BRAND.name, deletedAt: null },
+    select: { id: true },
+  })
+  const brandDescribable = {
+    domain: GEO_DEMO_BRAND.domain,
+    aliases: [...GEO_DEMO_BRAND.aliases],
+    engineCodes: [...GEO_DEMO_BRAND.engineCodes],
+    sampleSize: GEO_DEMO_BRAND.sampleSize,
+  }
+  const brandId = existingBrand
+    ? (await prisma.geoBrand.update({ where: { id: existingBrand.id }, data: brandDescribable })).id
+    : (
+        await prisma.geoBrand.create({
+          data: {
+            id: ulid(),
+            tenantId,
+            name: GEO_DEMO_BRAND.name,
+            status: 'ACTIVE',
+            refreshFreq: 'WEEKLY',
+            ...brandDescribable,
+          },
+        })
+      ).id
+
+  let competitorsCreated = 0
+  for (const item of GEO_DEMO_COMPETITORS) {
+    const existing = await prisma.geoCompetitor.findFirst({
+      where: { tenantId, brandId, name: item.name, deletedAt: null },
+      select: { id: true },
+    })
+    const data = { domain: item.domain, aliases: [...item.aliases] }
+    if (existing) {
+      await prisma.geoCompetitor.update({ where: { id: existing.id }, data })
+    } else {
+      await prisma.geoCompetitor.create({
+        data: { id: ulid(), tenantId, brandId, name: item.name, ...data },
+      })
+      competitorsCreated += 1
+    }
+  }
+
+  const existingSet = await prisma.geoPromptSet.findFirst({
+    where: { tenantId, brandId, name: GEO_DEMO_PROMPT_SET_NAME, deletedAt: null },
+    select: { id: true },
+  })
+  const promptSetId = existingSet
+    ? existingSet.id
+    : (
+        await prisma.geoPromptSet.create({
+          data: { id: ulid(), tenantId, brandId, name: GEO_DEMO_PROMPT_SET_NAME, source: 'MANUAL' },
+        })
+      ).id
+
+  let promptsCreated = 0
+  for (const item of GEO_DEMO_PROMPTS) {
+    // 与 `geo-prompt.service.ts` 建 Prompt 时同一个函数：去重指纹是「归一化正文」的
+    // sha256，不是原文本身，demo 数据也要照这个口径落，不然按 textHash 查重会对不上。
+    const textHash = hashPromptText(item.text)
+    const existing = await prisma.geoPrompt.findFirst({
+      where: { tenantId, brandId, textHash, deletedAt: null },
+      select: { id: true },
+    })
+    const data = { topic: item.topic, funnelStage: item.funnelStage, isTracked: true }
+    if (existing) {
+      await prisma.geoPrompt.update({ where: { id: existing.id }, data })
+    } else {
+      await prisma.geoPrompt.create({
+        data: { id: ulid(), tenantId, brandId, promptSetId, text: item.text, textHash, ...data },
+      })
+      promptsCreated += 1
+    }
+  }
+
+  const existingRule = await prisma.geoAlertRule.findFirst({
+    where: { tenantId, brandId, kind: 'VISIBILITY_DROP', deletedAt: null },
+    select: { id: true },
+  })
+  const ruleData = { thresholdBp: 1000, channels: ['INBOX'], enabled: true }
+  if (existingRule) {
+    await prisma.geoAlertRule.update({ where: { id: existingRule.id }, data: ruleData })
+  } else {
+    await prisma.geoAlertRule.create({
+      data: { id: ulid(), tenantId, brandId, kind: 'VISIBILITY_DROP', ...ruleData },
+    })
+  }
+
+  return { brandId, competitors: competitorsCreated, prompts: promptsCreated }
+}
+
+/**
+ * 喂给 `seedBase` 的 delegate 集合。
+ *
+ * `role` / `staff` 换成 `findFirst + create` 版本——它们的唯一键带 `deletedAt`，
+ * 而 Prisma 6.19 拒绝在唯一键里传 `null`。完整理由见 `seed-delegates.ts` 的文件头。
+ * 其余表的唯一键都是单列（`username` / `code` / `slug` / `phone`），原样传即可。
+ */
+const seedContext: SeedContext = {
+  platformAdmin: prisma.platformAdmin,
+  plan: prisma.plan,
+  tenant: prisma.tenant,
+  staffAccount: prisma.staffAccount,
+  staff: findFirstUpsertDelegate(prisma.staff),
+  role: findFirstUpsertDelegate(prisma.role),
+  rolePreset: prisma.rolePreset,
+  // T2-7：`NotifyTemplate.key` 是单列唯一索引，不带 deletedAt，原始 delegate 直接用。
+  notifyTemplate: prisma.notifyTemplate,
+}
+
+/**
+ * A 店的「商品查看员」角色。`permissionCodes` 里**只有** `goods:list`。
+ *
+ * 不用 `upsert`：`Role` 的唯一键是 `[tenantId, code, deletedAt]`，而 Prisma 6.19
+ * 拒绝在唯一键里传 `null`（`seed-delegates.ts` 的文件头写了完整理由）。
+ */
+async function seedViewerRole(tenantId: string): Promise<string> {
+  const existing = await prisma.role.findFirst({
+    where: { tenantId, code: VIEWER_ROLE.code, deletedAt: null },
+    select: { id: true },
+  })
+  const data = {
+    name: VIEWER_ROLE.name,
+    // 只给一个 code。写 `['goods:*']` 会在新增权限点时**静默放宽**——
+    // 明天加一个 `goods:delete`，这个角色后天就能删商品了。
+    permissionCodes: ['goods:list'],
+    builtin: false,
+  }
+  if (existing) {
+    await prisma.role.update({ where: { id: existing.id }, data })
+    return existing.id
+  }
+  const created = await prisma.role.create({
+    data: { id: ulid(), tenantId, code: VIEWER_ROLE.code, ...data },
+  })
+  return created.id
+}
+
+/**
+ * 挂那个角色的员工。
+ *
+ * `dataScope: 'SELF'` 是故意的：它同时演示了 `@DataScope({ ownerField: 'createdBy' })`——
+ * 这个人在商品列表里只看得到自己建的商品，而 seed 造的那三个商品 `createdBy` 是 null，
+ * 所以他一进去看到的是空列表。**这不是 bug**，正是数据范围在生效。
+ */
+async function seedViewerStaff(tenantId: string, roleId: string): Promise<void> {
+  const passwordHash = await hashPassword(DEMO_OWNER_PASSWORD)
+  // 同框架 seed 的第二条约定：**不重置已有账号的口令**。seed 要是能改密码，它就是个后门。
+  const account = await prisma.staffAccount.upsert({
+    where: { phone: VIEWER_STAFF.phone },
+    create: {
+      id: ulid(),
+      phone: VIEWER_STAFF.phone,
+      passwordHash,
+      name: VIEWER_STAFF.name,
+      status: 'ACTIVE',
+    },
+    update: { name: VIEWER_STAFF.name },
+  })
+
+  const existing = await prisma.staff.findFirst({
+    where: { tenantId, accountId: account.id, deletedAt: null },
+    select: { id: true },
+  })
+  const data = {
+    name: VIEWER_STAFF.name,
+    status: 'ACTIVE' as const,
+    roleIds: [roleId],
+    dataScope: 'SELF' as const,
+    isOwner: false,
+  }
+  if (existing) {
+    await prisma.staff.update({ where: { id: existing.id }, data })
+    return
+  }
+  await prisma.staff.create({ data: { id: ulid(), tenantId, accountId: account.id, ...data } })
+}
+
+/**
+ * A 店的演示邀请。
+ *
+ * 幂等，且**每次 seed 都把它重置成未使用**——它是开发夹具不是业务数据，
+ * 上一轮开发把它核销掉之后，下一次 `pnpm seed` 应该还能再试一遍。
+ * （这与「seed 不重置已有账号的口令」那条约定不冲突：那条守的是**别人的**凭据，
+ * 这里重置的是一张自己造出来的演示邀请。）
+ */
+async function seedDemoInvite(tenantId: string, roleId: string): Promise<string> {
+  const expiresAt = new Date(Date.now() + DEMO_INVITE.expiresInDays * 24 * 60 * 60 * 1000)
+  const data = {
+    phone: DEMO_INVITE.phone,
+    roleIds: [roleId],
+    expiresAt,
+    usedAt: null,
+    usedBy: null,
+  }
+  const row = await prisma.staffInvite.upsert({
+    where: { token: DEMO_INVITE.token },
+    create: { id: ulid(), tenantId, token: DEMO_INVITE.token, ...data },
+    update: data,
+  })
+  return row.token
+}
+
+/** 一条 `ALL_TENANT` 的已发布公告。幂等按 id（`Announcement` 没有自然键）。 */
+async function seedAnnouncement(): Promise<void> {
+  const data = {
+    title: DEMO_ANNOUNCEMENT.title,
+    contentHtml: DEMO_ANNOUNCEMENT.contentHtml,
+    audience: 'ALL_TENANT' as const,
+    audienceRefs: Prisma.JsonNull,
+    level: 'INFO' as const,
+    // 发布时间取「昨天」而不是 `now`：`publishAt <= now` 是可见性条件之一，
+    // 用 `now` 的话，同一次 seed 里紧接着跑的断言会卡在毫秒级的边界上。
+    publishAt: new Date(Date.now() - 24 * 60 * 60 * 1000),
+    expireAt: null,
+    status: 'PUBLISHED' as const,
+  }
+  await prisma.announcement.upsert({
+    where: { id: DEMO_ANNOUNCEMENT.id },
+    create: { id: DEMO_ANNOUNCEMENT.id, ...data },
+    update: data,
+  })
+}
+
+/**
+ * 把一家店改成「昨天就到期了」。
+ *
+ * `status` 一并从 `TRIAL` 改成 `ACTIVE`、`trialEndAt` 清空：`evaluateTenantGate` 对
+ * `TRIAL` 的租户优先按 `trialEndAt` 算，留着它的话改 `planExpireAt` 不会有任何效果——
+ * 那种「改了没反应」最难查。
+ *
+ * `graceDays` 归 0：`seedDemoTenant` 给的是 3 天宽限，而宽限期内后台仍然可写，
+ * 演示「到期只读」就演示不出来。
+ */
+async function expireTenant(tenantId: string): Promise<void> {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  await prisma.tenant.update({
+    where: { id: tenantId },
+    data: { status: 'ACTIVE', planExpireAt: yesterday, trialEndAt: null, graceDays: 0 },
+  })
+}
+
+/**
+ * 把代码里的权限点 / 菜单注册表镜像进 `Permission` / `Menu` 表。
+ *
+ * ## 为什么在 seed 里，而不是在应用启动时
+ *
+ * 「启动即同步」听起来更省事，代价是**每个进程启动都会写一次库**：4 个 PM2 实例
+ * 同时启动就是 4 份并发 upsert，而滚动发布期间新旧两版代码的注册表还不一样，
+ * 会互相覆盖。同步是一次**发布动作**，不是一次启动动作。
+ *
+ * 生产上它由 `taizan-rbac-sync --adapter …`（`@taizan/nest-rbac` 的 CLI）在发布流程里跑；
+ * 本地开发就是这里，跟着 `pnpm seed` 一起。
+ *
+ * `RbacSyncService` 手工 `new` 而不是从 Nest 容器里取：seed 是个脚本，为了两次 upsert
+ * 起一整个应用（连 Redis、起队列 worker）不值得。它的三个依赖都能直接构造。
+ */
+async function syncRbacRegistries(): Promise<{ permissions: number; menus: number }> {
+  const permissionRegistry = new PermissionRegistry([PERMISSIONS])
+  const menuRegistry = new MenuRegistry(permissionRegistry, [ALL_MENUS])
+  // raw-reason: Permission / Menu 是平台域镜像表（没有 tenantId 列），
+  // 走 prisma.tenant 会被隔离扩展当成未登记模型直接抛错。
+  const sync = new RbacSyncService({ raw: prisma }, permissionRegistry, menuRegistry)
+  const report = await sync.syncAll()
+  return { permissions: report.permissions.upserted, menus: report.menus.upserted }
+}
+
+/**
+ * 系统基线配置：套餐 features/GEO 配额、GEO 引擎接入点、引用来源归类规则、RBAC 镜像。
+ *
+ * 写的都是平台级配置或两档套餐共享的数据，不属于任何一个租户——`runFull()`（本地开发/
+ * 演示环境）与 `runProd()`（生产初始化）都要跑这一段，区别只在于要不要再往上叠演示租户。
+ */
+async function seedSystemConfig(plans: {
+  trial: { id: string; code: string }
+  standard: { id: string; code: string }
+}): Promise<{
+  geoEngines: number
+  geoRules: number
+  mirror: { permissions: number; menus: number }
+}> {
+  // 体验版套餐的功能项对齐本应用的注册表，见 TRIAL_PLAN_FEATURES 的注释。
+  await prisma.plan.update({
+    where: { id: plans.trial.id },
+    data: { features: [...TRIAL_PLAN_FEATURES] },
+  })
+
+  // 两档套餐补 GEO_* 配额（T8，技术设计 §8 第 1 条）。合并写入，不动框架维度。
+  await seedGeoPlanQuotas(plans.trial.id, plans.trial.code)
+  await seedGeoPlanQuotas(plans.standard.id, plans.standard.code)
+
+  // 平台域：GEO 引擎接入点 + 引用来源归类规则（T5）。两张表都没有 tenantId。
+  const geoEngines = await seedGeoEngines()
+  const geoRules = await seedGeoSourceRules()
+
+  // 权限点 / 菜单注册表 → DB 镜像。
+  const mirror = await syncRbacRegistries()
+
+  return { geoEngines, geoRules, mirror }
+}
+
+/** 强随机口令：16 字节、URL-safe base64（22 个字符），生产初始化专用。 */
+function generateStrongPassword(): string {
+  return randomBytes(16).toString('base64url')
+}
+
+/**
+ * 生产初始化：只建系统基线，**不建任何演示租户/演示数据**（平台管理员、两档套餐、
+ * 角色模板、GEO 系统配置、RBAC 镜像）。`pnpm -F @taizan/api seed --prod`。
+ *
+ * 幂等——重复跑不会重置平台管理员口令（`seedBase` 的第二条约定）。**第一次跑**会生成
+ * 一个随机管理员口令，只打印一次到本次执行的 stdout，此后任何地方都不再出现；
+ * 没记下来的话，只能去库里用 `hashPassword()`（`@taizan/prisma-base`）手动生成新哈希
+ * 写回 `PlatformAdmin.passwordHash`。
+ */
+async function runProd(): Promise<void> {
+  // `seedPlatformAdmin` 的 upsert 只在**新建**分支写 passwordHash，已存在的账号
+  // update 分支根本不碰密码（见 `@taizan/prisma-base` 的 platform-admin.ts 文件头）。
+  // 所以「这次生成的随机密码是不是真的生效」取决于账号是不是新建的——必须在
+  // seedBase 跑之前就查一次，跑完了再看 upsert 结果已经来不及分辨 create/update。
+  const existingAdmin = await prisma.platformAdmin.findUnique({
+    where: { username: DEFAULT_ADMIN_USERNAME },
+    select: { id: true },
+  })
+  const isNewAdmin = existingAdmin === null
+
+  const adminPassword = generateStrongPassword()
+  const base = await seedBase(seedContext, { withDemoTenant: false, adminPassword })
+  const { geoEngines, geoRules, mirror } = await seedSystemConfig(base.plans)
+
+  process.stdout.write(
+    [
+      '✓ 生产基线 seed 完成（未建任何演示租户/演示数据）',
+      `  平台超管        ${DEFAULT_ADMIN_USERNAME}`,
+      `  套餐            ${base.plans.trial.code} / ${base.plans.standard.code}`,
+      `  角色模板        ${base.rolePresetCount} 条`,
+      `  通知模板        ${base.notifyTemplateCount} 条`,
+      `  GEO 引擎        ${GEO_ENGINES.length} 个（本次新建 ${geoEngines}）——mock 只是凭据占位，` +
+        `生产环境运行时本就不会装配它；qwen/ernie 需要在平台后台填真密钥后开启`,
+      `  GEO 来源规则    ${GEO_SOURCE_RULES.length} 条（本次新建 ${geoRules}）`,
+      `  RBAC 镜像       Permission ${mirror.permissions} 条、Menu ${mirror.menus} 条`,
+      '',
+      ...(isNewAdmin
+        ? [
+            '  ⚠ 平台超管初始口令（仅本次显示一次，未写入任何日志/文件，请立即保存）：',
+            `      ${DEFAULT_ADMIN_USERNAME} / ${adminPassword}`,
+          ]
+        : [
+            `  平台超管账号 ${DEFAULT_ADMIN_USERNAME} 已存在，本次 seed 未改动它的密码` +
+              '（seed 的约定是不重置已有账号的口令，上面生成的随机串没有生效）。',
+          ]),
+      '',
+    ].join('\n'),
+  )
+}
+
+/**
+ * 本地开发 / 演示环境：系统基线 + 两家演示店 + GEO 演示品牌等全部演示数据。
+ * `pnpm -F @taizan/api seed`（不带 `--prod`）。行为与拆分前完全一致，含默认管理员口令
+ * `admin123`——本地开发与 `pnpm test:e2e` 都走这条路径。
+ */
+async function runFull(): Promise<void> {
+  // 1) 框架基线：平台管理员 + 两档套餐 + 内置角色模板 + 演示租户 A（slug `demo`）。
+  const base = await seedBase(seedContext)
+  const demoA = base.demo
+  if (!demoA) throw new Error('seedBase 没有建出演示租户，withDemoTenant 被关掉了？')
+
+  // 2) 第二家店。复用框架的 `seedDemoTenant`——它已经把「账号 → 租户 → 角色 → 成员」
+  //    这个依赖顺序处理好了，自己再拼一遍只会拼错。
+  const demoB = await seedDemoTenant({
+    tenant: seedContext.tenant,
+    staffAccount: seedContext.staffAccount,
+    staff: seedContext.staff,
+    role: seedContext.role,
+    newId: ulid,
+    now: new Date(),
+    slug: SHOP_B.slug,
+    name: SHOP_B.name,
+    trialDays: 14,
+    planId: base.plans.trial.id,
+    ownerPhone: SHOP_B.ownerPhone,
+    ownerPassword: DEMO_OWNER_PASSWORD,
+    ownerName: SHOP_B.ownerName,
+  })
+
+  // 3) 系统配置：套餐 features/GEO 配额、GEO 引擎与来源规则、RBAC 镜像——
+  //    与生产基线共用同一段，见 seedSystemConfig。
+  const { geoEngines, geoRules, mirror } = await seedSystemConfig(base.plans)
+
+  // 4) 两家店各自的商品。
+  const createdA = await seedGoods(demoA.tenant.id, GOODS_A)
+  const createdB = await seedGoods(demoB.tenant.id, GOODS_B)
+
+  // 5) A 店：一个只含 `goods:list` 的角色 + 一名挂着它的员工。
+  const viewerRoleId = await seedViewerRole(demoA.tenant.id)
+  await seedViewerStaff(demoA.tenant.id, viewerRoleId)
+
+  // 6) B 店：**到期**。计费闸门的演示对照组。
+  await expireTenant(demoB.tenant.id)
+
+  // 7) A 店：一张没人用过的员工邀请（T1-9，演示 /api/public/invites/:token 那条路）。
+  const inviteToken = await seedDemoInvite(demoA.tenant.id, viewerRoleId)
+
+  // 8) 一条面向全平台的公告（T1-9，商家后台「平台公告」那一页的样本数据）。
+  await seedAnnouncement()
+
+  // 9) A 店：GEO 演示数据——品牌「钛赞云」+ 2 竞品 + 1 Prompt 集合 + 5 Prompt +
+  //    1 条可见度告警规则（T8，技术设计 §8 第 4 条）。只挂 A 店，B 店是到期对照组。
+  const geoDemo = await seedGeoDemoData(demoA.tenant.id)
+
+  process.stdout.write(
+    [
+      '✓ seed 完成',
+      `  平台超管        ${DEFAULT_ADMIN_USERNAME} / ${DEFAULT_ADMIN_PASSWORD}`,
+      `  套餐            ${base.plans.trial.code} / ${base.plans.standard.code}`,
+      `  角色模板        ${base.rolePresetCount} 条`,
+      `  演示店 A        ${demoA.tenant.slug}（${demoA.tenant.id}）店主 ${demoA.ownerAccount.phone} / ${DEMO_OWNER_PASSWORD}`,
+      `  演示店 B        ${demoB.tenant.slug}（${demoB.tenant.id}）店主 ${demoB.ownerAccount.phone} / ${DEMO_OWNER_PASSWORD}`,
+      `  商品            A 店 ${GOODS_A.length} 个（本次新建 ${createdA}）、B 店 ${GOODS_B.length} 个（本次新建 ${createdB}）`,
+      `  内置店主角色    ${OWNER_ROLE_CODE}`,
+      `  A 店受限员工    ${VIEWER_STAFF.phone} / ${DEMO_OWNER_PASSWORD}（角色 ${VIEWER_ROLE.code}，只有 goods:list）`,
+      `  B 店            **已到期**（planExpireAt = 昨天，graceDays=0）——计费闸门的对照组`,
+      `  演示邀请        GET /api/public/invites/${inviteToken}（不限手机号，10 年有效，每次 seed 重置成未使用）`,
+      `  平台公告        「${DEMO_ANNOUNCEMENT.title}」（ALL_TENANT / PUBLISHED，两家店都看得到）`,
+      `  GEO 引擎        ${GEO_ENGINES.length} 个（本次新建 ${geoEngines}）——只有 mock 默认启用，qwen/ernie 是占位，填密钥后再开`,
+      `  GEO 来源规则    ${GEO_SOURCE_RULES.length} 条（本次新建 ${geoRules}）`,
+      `  GEO 演示品牌    「${GEO_DEMO_BRAND.name}」（${geoDemo.brandId}）竞品 ${GEO_DEMO_COMPETITORS.length} 个、Prompt ${GEO_DEMO_PROMPTS.length} 条、告警规则 1 条`,
+      `  RBAC 镜像       Permission ${mirror.permissions} 条、Menu ${mirror.menus} 条`,
+      `  通知模板        NotifyTemplate ${base.notifyTemplateCount} 条`,
+      '',
+      '  ⚠ 以上口令只用于本地开发，上线前必须改。',
+      '',
+    ].join('\n'),
+  )
+}
+
+/** `--prod` 走生产基线（无演示数据），不带就是本地开发全量 seed（行为不变）。 */
+async function main(): Promise<void> {
+  const isProd = process.argv.slice(2).includes('--prod')
+  if (isProd) {
+    await runProd()
+  } else {
+    await runFull()
+  }
+}
+
+main()
+  .catch((error: unknown) => {
+    process.exitCode = 1
+    process.stderr.write(`seed 失败：${error instanceof Error ? error.stack : String(error)}\n`)
+  })
+  .finally(() => {
+    void prisma.$disconnect()
+  })

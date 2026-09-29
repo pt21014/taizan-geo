@@ -1,0 +1,38 @@
+{
+  "output": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "message": {
+          "role": "assistant",
+          "content": "国内做 GEO 监测的工具主要有 泰赞GEO[ref_1]、新榜智汇 等几家[ref_2]。"
+        }
+      }
+    ],
+    "search_info": {
+      "search_results": [
+        {
+          "site_name": "泰赞",
+          "icon": "https://img.alicdn.com/mock-icon.png",
+          "index": 1,
+          "title": "泰赞 GEO 产品介绍",
+          "url": "https://www.example.org/geo?utm_source=qwen&utm_medium=search#intro"
+        },
+        {
+          "site_name": "新榜",
+          "icon": "",
+          "index": 2,
+          "title": "新榜智汇 GEO",
+          "url": "https://geo.newrank.cn/"
+        }
+      ]
+    }
+  },
+  "usage": {
+    "total_tokens": 322,
+    "output_tokens": 240,
+    "input_tokens": 82,
+    "search_count": 1
+  },
+  "request_id": "b1a2c3d4-0000-4000-8000-000000000001"
+}

@@ -1,0 +1,709 @@
+/**
+ * **GEO 全链路收口 e2e**（T8）：跑在真 MySQL(3307) + 真 Redis 上，覆盖
+ * `geo-run.e2e-spec.ts` 没有覆盖的那一段——聚合之后的只读查询侧与告警/报表/用量。
+ *
+ * ```
+ * pnpm dev:infra
+ * pnpm -F @taizan/api prisma:migrate
+ * pnpm -F @taizan/api test:e2e
+ * ```
+ *
+ * ## 与 `geo-run.e2e-spec.ts` 的分工
+ *
+ * 那份文件已经把 `POST /geo/runs` → 执行 → 分析 → 配额 → 跨租户隔离 → 引擎失败
+ * 这一段钉死了。这份文件**复用同一条流水线把数据跑出来**，然后专门断言它没管的那段：
+ * `geo.daily.aggregate`（settle 自动派生）→ `dashboard`/`citation`（只读查询）→
+ * `alert`（规则 CRUD + 事件）→ `report`（生成/幂等）→ `usage`（商家 + 平台）→
+ * `platform/geo/runs`（跨租户监控 + 重跑闸门）。
+ *
+ * ## 告警触发为什么手动调 handler 而不是等第二个自然日
+ *
+ * `geo.alert.evaluate` 比的是「今天 vs 昨天」，而这份 e2e 只跑一次批次、只有「今天」
+ * 一天的数据——mock 引擎每条回答都 100% 提及本品牌（见 `geo-run.e2e-spec.ts` 的用例⑤），
+ * 没有"变差"可言，也没有可以等的"昨天"。`GeoAlertEvaluateHandler` 本身只有队列/cron
+ * 触发点，没有 HTTP 入口；VISIBILITY_DROP 的判定逻辑已经由
+ * `geo-alert.rules.spec.ts` 的纯函数单测钉住。这里要验证的是**接线**——聚合写完的
+ * 汇总行 + 手工造的一条"昨天"基线，`GeoAlertEvaluateHandler.process()` 真的能读出来、
+ * 落一条 `GeoAlertEvent`、且 `GET /alert-events` 能查到——所以直接从 DI 容器取
+ * handler 实例调用，不经过队列，理由与 `plan-lifecycle.e2e-spec.ts` 直接
+ * `app.get(ExpireNotifyCron)` 是同一招。
+ *
+ * ## 用例清单
+ *
+ * ① 平台登录 → 开一家店 → 建品牌 + 2 竞品 + 3 问法 → 跑批到 DONE
+ * ② 轮询到 `geo.daily.aggregate` 自动派生完成（`GeoVisibilityDaily` 出现）
+ * ③ dashboard 五条只读接口都能查到今天这一批
+ * ④ citation 三条只读接口都能查到今天的引用
+ * ⑤ usage(商家) 能查到今天这一批的成本
+ * ⑥ report 手动生成（同步）+ 幂等 + 列表 + 详情（排在 alert 之前，见该 describe 块的注释）
+ * ⑦ alert-rules CRUD；手工造"昨天"基线 + 直调 handler → 事件真的落库、`GET /alert-events` 查得到
+ * ⑧ platform：usage(平台) 能看到这家店；runs 列表能看到这次跑批；重跑闸门（没有失败结果时拒绝）
+ * ⑨ 配额：套餐 `GEO_BRAND: 1` 时再建第二个品牌 → 拒绝，且品牌数不变
+ *
+ * @packageDocumentation
+ */
+
+import 'reflect-metadata'
+import 'dotenv/config'
+
+import type { INestApplication } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import { PrismaClient } from '@prisma/client'
+import { ulid } from '@taizan/contracts'
+import { PLATFORM_GATEWAY, type PlatformGateway } from '@taizan/nest-billing'
+import { runWithContext } from '@taizan/nest-core'
+import type { JobEnvelope } from '@taizan/nest-infra'
+import { seedBase } from '@taizan/prisma-base'
+import request from 'supertest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import { AppModule } from '../src/bootstrap/app.module'
+import { configureApp } from '../src/bootstrap/configure-app'
+import { findFirstUpsertDelegate } from '../src/seed-delegates'
+import {
+  GeoAlertEvaluateHandler,
+  type GeoAlertEvaluatePayload,
+} from '../src/modules/geo/alert/geo-alert-evaluate.handler'
+import { dateKeyToDbDate, toDateKey } from '../src/modules/geo/aggregate/geo-metrics.rules'
+import { solveCaptcha } from './helpers/solve-captcha'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 夹具
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 每次跑用一段唯一后缀，重复跑也不打架。 */
+const RUN = ulid().slice(-8).toLowerCase()
+
+const OWNER_PASSWORD = 'e2e-password-123'
+
+/**
+ * 登录限流按客户端 IP 分桶（5 分钟 10 次）。已用过的段：
+ * `geo-run` 10.96.*、`tenant-isolation` 10.97.*、`geo-brand` 10.98.*、
+ * `geo-engine`/`platform` 10.99.*——这份文件用 10.95.*，避免撞桶。
+ */
+const LOGIN_IP = `10.95.${([...RUN].reduce((a, c) => (a + c.charCodeAt(0)) % 200, 11) + 1).toString()}.7`
+
+const BRAND_DOMAIN = `taizan-geo-${RUN}.example.com`
+
+/** 3 问法 × 1 引擎 × 1 采样 = 3 条查询。跑批要等真队列，样本数刻意压到最小。 */
+const PROMPT_COUNT = 3
+const SAMPLE_SIZE = 1
+const EXPECTED_RESULTS = PROMPT_COUNT * SAMPLE_SIZE
+
+const TERMINAL_DEADLINE_MS = 50_000
+const AGGREGATE_DEADLINE_MS = 20_000
+
+let app: INestApplication
+let prisma: PrismaClient
+let gateway: PlatformGateway
+
+function http(): Parameters<typeof request>[0] {
+  return app.getHttpServer() as Parameters<typeof request>[0]
+}
+
+function loginRequest(url: string) {
+  return request(http()).post(url).set('X-Forwarded-For', LOGIN_IP)
+}
+
+function expectOk<T>(body: unknown): T {
+  const envelope = body as { code: number; message: string; data: T }
+  expect(envelope.code, `期望 code=0，实际：${JSON.stringify(envelope)}`).toBe(0)
+  return envelope.data
+}
+
+function codeOf(body: unknown): number {
+  return (body as { code: number }).code
+}
+
+function messageOf(body: unknown): string {
+  return (body as { message: string }).message
+}
+
+function phoneFor(n: number): string {
+  const digits = [...RUN]
+    .map((c) => c.charCodeAt(0) % 10)
+    .join('')
+    .slice(0, 7)
+  return `138${digits}${n}`
+}
+
+interface Shop {
+  tenantId: string
+  token: string
+}
+
+let platformToken = ''
+let shopA: Shop
+let brandA = ''
+let runA = ''
+let mockEngineId = ''
+let todayKey = ''
+
+async function createShopAndLogin(index: number): Promise<Shop> {
+  const phone = phoneFor(index)
+  const created = await request(http())
+    .post('/api/platform/tenants')
+    .set('Authorization', `Bearer ${platformToken}`)
+    .send({
+      slug: `e2e-geo-${index}-${RUN}`,
+      name: `E2E GEO ${index} ${RUN}`,
+      ownerPhone: phone,
+      ownerPassword: OWNER_PASSWORD,
+      trialDays: 30,
+    })
+  const data = expectOk<{ tenant: { id: string } }>(created.body)
+
+  const login = await loginRequest('/api/admin/auth/login').send({
+    phone,
+    password: OWNER_PASSWORD,
+    tenantId: data.tenant.id,
+    ...(await solveCaptcha(app)),
+  })
+  const session = expectOk<{ access: string }>(login.body)
+  return { tenantId: data.tenant.id, token: session.access }
+}
+
+function asShop(shop: Shop) {
+  const token = `Bearer ${shop.token}`
+  return {
+    get: (url: string, query?: Record<string, unknown>) =>
+      request(http())
+        .get(url)
+        .query(query ?? {})
+        .set('Authorization', token),
+    post: (url: string, body?: unknown) =>
+      request(http())
+        .post(url)
+        .set('Authorization', token)
+        .send(body ?? {}),
+    put: (url: string, body?: unknown) =>
+      request(http())
+        .put(url)
+        .set('Authorization', token)
+        .send(body ?? {}),
+    delete: (url: string) => request(http()).delete(url).set('Authorization', token),
+  }
+}
+
+function asPlatform() {
+  const token = `Bearer ${platformToken}`
+  return {
+    get: (url: string, query?: Record<string, unknown>) =>
+      request(http())
+        .get(url)
+        .query(query ?? {})
+        .set('Authorization', token),
+    post: (url: string, body?: unknown) =>
+      request(http())
+        .post(url)
+        .set('Authorization', token)
+        .send(body ?? {}),
+  }
+}
+
+/** 建一档套餐（平台域表，直接写库——套餐管理接口是另一条工作流）。 */
+async function createPlan(quotas: Record<string, number | null>): Promise<string> {
+  const plan = await prisma.plan.create({
+    data: {
+      id: ulid(),
+      code: `e2e-geo-plan-${ulid().slice(-8).toLowerCase()}`,
+      name: 'E2E GEO 套餐',
+      firstPriceCents: 0,
+      renewPriceCents: 0,
+      periodMonths: 1,
+      quotas,
+      appKeys: ['admin', 'client'],
+      trafficMb: 0,
+    },
+  })
+  return plan.id
+}
+
+async function mutateTenant(tenantId: string, data: Record<string, unknown>): Promise<void> {
+  await prisma.tenant.update({ where: { id: tenantId }, data })
+  gateway.invalidate(tenantId)
+}
+
+/** 保证 `mock` 引擎在库里、已启用、不带 `credentialEnc`（默认 `mention` 场景）。 */
+async function seedMockEngine(): Promise<string> {
+  const existing = await prisma.geoEngine.findUnique({ where: { code: 'mock' } })
+  if (existing) {
+    await prisma.geoEngine.update({
+      where: { id: existing.id },
+      data: {
+        enabled: true,
+        credentialEnc: null,
+        credentialKeyId: null,
+        credentialMasked: null,
+        rateLimitPerMin: 600,
+      },
+    })
+    return existing.id
+  }
+  const row = await prisma.geoEngine.create({
+    data: {
+      id: ulid(),
+      code: 'mock',
+      name: 'Mock（联调用）',
+      vendor: 'taizan',
+      model: 'mock-engine-v1',
+      accessType: 'API',
+      enabled: true,
+      rateLimitPerMin: 600,
+      config: {},
+    },
+  })
+  return row.id
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForTerminal(shop: Shop, runId: string): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + TERMINAL_DEADLINE_MS
+  let last: Record<string, unknown> = {}
+  while (Date.now() < deadline) {
+    const res = await asShop(shop).get(`/api/admin/geo/runs/${runId}`)
+    last = expectOk<Record<string, unknown>>(res.body)
+    const status = String(last['status'])
+    if (status === 'DONE' || status === 'PARTIAL' || status === 'FAILED') return last
+    await sleep(400)
+  }
+  throw new Error(`跑批 ${runId} 在 ${TERMINAL_DEADLINE_MS}ms 内没有进入终态：${JSON.stringify(last)}`)
+}
+
+/**
+ * 轮询到 `settle()` 派生的 `geo.daily.aggregate` 真的跑完——`GeoVisibilityDaily`
+ * 里出现今天这一行全局汇总（`engineCode === ''`、`promptId === ''`）。
+ */
+async function waitForAggregate(brandId: string, dateKey: string): Promise<void> {
+  const deadline = Date.now() + AGGREGATE_DEADLINE_MS
+  while (Date.now() < deadline) {
+    const row = await prisma.geoVisibilityDaily.findFirst({
+      where: { brandId, engineCode: '', promptId: '', date: dateKeyToDbDate(dateKey) },
+    })
+    if (row) return
+    await sleep(300)
+  }
+  throw new Error(
+    `品牌 ${brandId} 在 ${dateKey} 的每日聚合在 ${AGGREGATE_DEADLINE_MS}ms 内没有出现，` +
+      '先确认 settle() 是否真的入队了 geo.daily.aggregate、以及该 handler 是否进了 providers。',
+  )
+}
+
+beforeAll(async () => {
+  prisma = new PrismaClient()
+
+  await seedBase(
+    {
+      platformAdmin: prisma.platformAdmin,
+      plan: prisma.plan,
+      tenant: prisma.tenant,
+      staffAccount: prisma.staffAccount,
+      staff: findFirstUpsertDelegate(prisma.staff),
+      role: findFirstUpsertDelegate(prisma.role),
+      rolePreset: prisma.rolePreset,
+    },
+    { withDemoTenant: false },
+  )
+
+  mockEngineId = await seedMockEngine()
+
+  const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile()
+  app = moduleRef.createNestApplication({ logger: false })
+  configureApp(app)
+  await app.init()
+  gateway = app.get<PlatformGateway>(PLATFORM_GATEWAY)
+})
+
+afterAll(async () => {
+  await app?.close()
+  await prisma?.$disconnect()
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 用例
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('① 登录开店，建监测对象，跑一批到 DONE', () => {
+  it('平台超管登录，开一家店', async () => {
+    const res = await loginRequest('/api/platform/auth/login')
+      .send({ username: 'admin', password: 'admin123', ...(await solveCaptcha(app)) })
+      .expect(201)
+    platformToken = expectOk<{ access: string }>(res.body).access
+    shopA = await createShopAndLogin(1)
+    expect(mockEngineId).not.toBe('')
+  })
+
+  it('建品牌 + 2 竞品 + 3 问法', async () => {
+    const res = await asShop(shopA).post('/api/admin/geo/brands', {
+      name: `钛赞云 ${RUN}`,
+      domain: BRAND_DOMAIN,
+      aliases: ['Taizan'],
+      industry: 'SaaS',
+      engineCodes: ['mock'],
+      sampleSize: SAMPLE_SIZE,
+    })
+    const brand = expectOk<{ id: string }>(res.body)
+    brandA = brand.id
+
+    for (const name of [`竞品甲 ${RUN}`, `竞品乙 ${RUN}`]) {
+      const c = await asShop(shopA).post(`/api/admin/geo/brands/${brandA}/competitors`, {
+        name,
+        domain: `${name.split(' ')[0]}-${RUN}.example.net`,
+      })
+      expect(codeOf(c.body)).toBe(0)
+    }
+    for (let i = 1; i <= PROMPT_COUNT; i++) {
+      const p = await asShop(shopA).post('/api/admin/geo/prompts', {
+        brandId: brandA,
+        text: `钛赞云全链路 e2e 第${i}问 ${RUN}`,
+      })
+      expect(codeOf(p.body)).toBe(0)
+    }
+  })
+
+  it('POST /geo/runs → 轮询到 DONE', async () => {
+    const res = await asShop(shopA).post('/api/admin/geo/runs', { brandId: brandA })
+    const run = expectOk<{ id: string; status: string }>(res.body)
+    runA = run.id
+    expect(run.status).toBe('PENDING')
+
+    const done = await waitForTerminal(shopA, runA)
+    expect(done['status']).toBe('DONE')
+    expect(done['totalQueries']).toBe(EXPECTED_RESULTS)
+    expect(done['failedQueries']).toBe(0)
+  })
+})
+
+describe('② settle() 自动派生的每日聚合', () => {
+  it('GeoVisibilityDaily 出现今天这一行全局汇总', async () => {
+    todayKey = toDateKey(new Date())
+    await waitForAggregate(brandA, todayKey)
+
+    const row = await prisma.geoVisibilityDaily.findFirst({
+      where: { brandId: brandA, engineCode: '', promptId: '', date: dateKeyToDbDate(todayKey) },
+    })
+    expect(row).toBeTruthy()
+    expect(row?.answers).toBe(EXPECTED_RESULTS)
+    // mock 引擎每条都 100% 提及品牌（见 geo-run.e2e-spec.ts 用例⑤）。
+    expect(row?.mentionRateBp).toBe(10_000)
+  })
+})
+
+describe('③ dashboard 五条只读接口', () => {
+  it('overview：当前周期 answers = 3，lastRun 是刚跑完的那次', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/dashboard/overview', { brandId: brandA })
+    const view = expectOk<{
+      current: { answers: number; mentionRateBp: number }
+      lastRun: { id: string; status: string } | null
+    }>(res.body)
+    expect(view.current.answers).toBe(EXPECTED_RESULTS)
+    expect(view.current.mentionRateBp).toBe(10_000)
+    expect(view.lastRun?.id).toBe(runA)
+    expect(view.lastRun?.status).toBe('DONE')
+  })
+
+  it('trend：今天这一点在序列里', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/dashboard/trend', { brandId: brandA })
+    const view = expectOk<{ points: Array<{ date: string; answers: number }> }>(res.body)
+    const todayPoint = view.points.find((p) => p.date === todayKey)
+    expect(todayPoint, `趋势里没有今天(${todayKey})这一点：${JSON.stringify(view.points)}`).toBeTruthy()
+    expect(todayPoint?.answers).toBe(EXPECTED_RESULTS)
+  })
+
+  it('engines：mock 引擎一行，提及率 100%', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/dashboard/engines', { brandId: brandA })
+    const view = expectOk<{ items: Array<{ engineCode: string; mentionRateBp: number }> }>(res.body)
+    const mock = view.items.find((i) => i.engineCode === 'mock')
+    expect(mock).toBeTruthy()
+    expect(mock?.mentionRateBp).toBe(10_000)
+  })
+
+  it('competitors：第一行是本品牌', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/dashboard/competitors', { brandId: brandA })
+    const view = expectOk<{ items: Array<{ isBrand: boolean; competitorId: string }> }>(res.body)
+    expect(view.items[0]?.isBrand).toBe(true)
+    expect(view.items[0]?.competitorId).toBe('')
+  })
+
+  it('prompts：3 条问法都出现，分页字段齐全', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/dashboard/prompts', {
+      brandId: brandA,
+      pageSize: 50,
+    })
+    const page = expectOk<{ items: Array<{ promptId: string; text: string }>; total: number }>(
+      res.body,
+    )
+    expect(page.total).toBe(PROMPT_COUNT)
+    expect(page.items.every((i) => i.text !== '')).toBe(true)
+  })
+})
+
+describe('④ citation 三条只读接口', () => {
+  it('domains：品牌官网在榜，owned = true', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/citations/domains', { brandId: brandA })
+    const view = expectOk<{
+      items: Array<{ domain: string; owned: boolean; category: string }>
+    }>(res.body)
+    const owned = view.items.find((i) => i.domain === BRAND_DOMAIN)
+    expect(owned, `域名榜里没有品牌官网 ${BRAND_DOMAIN}：${JSON.stringify(view.items)}`).toBeTruthy()
+    expect(owned?.owned).toBe(true)
+    expect(owned?.category).toBe('OWNED')
+  })
+
+  it('platforms：至少有 OWNED 这一档占比', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/citations/platforms', { brandId: brandA })
+    const view = expectOk<{ total: number; items: Array<{ category: string; shareBp: number }> }>(
+      res.body,
+    )
+    expect(view.total).toBeGreaterThan(0)
+    expect(view.items.some((i) => i.category === 'OWNED')).toBe(true)
+  })
+
+  it('list：引用明细分页，附问法原文', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/citations', { brandId: brandA, pageSize: 50 })
+    const page = expectOk<{ items: Array<{ promptText: string; domain: string }>; total: number }>(
+      res.body,
+    )
+    expect(page.total).toBeGreaterThan(0)
+    expect(page.items.every((i) => i.promptText !== '')).toBe(true)
+  })
+})
+
+describe('⑤ usage(商家)：本店这一批的成本', () => {
+  it('summary：byMetric 里有 QUERY，总成本 = 各项之和', async () => {
+    const res = await asShop(shopA).get('/api/admin/geo/usage/summary', { brandId: brandA })
+    const view = expectOk<{
+      totalCostCents: number
+      byMetric: Array<{ metric: string; quantity: number; costCents: number }>
+    }>(res.body)
+    const query = view.byMetric.find((m) => m.metric === 'QUERY')
+    expect(query?.quantity).toBe(EXPECTED_RESULTS)
+    const sum = view.byMetric.reduce((s, m) => s + m.costCents, 0)
+    expect(view.totalCostCents).toBe(sum)
+  })
+})
+
+describe('⑥ report：手动生成 + 幂等 + 列表 + 详情', () => {
+  let reportId = ''
+
+  // 这一段必须排在「⑦ alert」前面：alert 用例会手工造一条"昨天"的
+  // GeoVisibilityDaily 基线，那条基线会落进本周的日期范围——report 的 overview
+  // 是把周期内每天的行加总，先跑 report 才能保证 answers 只数到「今天」这一天。
+  it('POST /reports/generate：本周（含今天）的周报，overview.answers = 3', async () => {
+    const periodStart = mondayOfWeekContaining(todayKey)
+    const res = await asShop(shopA).post('/api/admin/geo/reports/generate', {
+      brandId: brandA,
+      period: 'WEEKLY',
+      periodStart,
+    })
+    const report = expectOk<{
+      id: string
+      period: string
+      periodStart: string
+      payload: { version: number; overview: { answers: number }; trend: unknown[] }
+    }>(res.body)
+    reportId = report.id
+    expect(report.period).toBe('WEEKLY')
+    expect(report.periodStart).toBe(periodStart)
+    expect(report.payload.version).toBe(1)
+    expect(report.payload.overview.answers).toBe(EXPECTED_RESULTS)
+  })
+
+  it('再生成同一周期 → 幂等回同一个 id（不重算、不建新行）', async () => {
+    const periodStart = mondayOfWeekContaining(todayKey)
+    const res = await asShop(shopA).post('/api/admin/geo/reports/generate', {
+      brandId: brandA,
+      period: 'WEEKLY',
+      periodStart,
+    })
+    expect(expectOk<{ id: string }>(res.body).id).toBe(reportId)
+  })
+
+  it('列表能查到（不含 payload）；详情含完整快照', async () => {
+    const list = await asShop(shopA).get('/api/admin/geo/reports', { brandId: brandA })
+    const page = expectOk<{ items: Array<{ id: string }> }>(list.body)
+    expect(page.items.some((r) => r.id === reportId)).toBe(true)
+
+    const detail = await asShop(shopA).get(`/api/admin/geo/reports/${reportId}`)
+    const view = expectOk<{ payload: { topCitations: unknown[] } }>(detail.body)
+    expect(Array.isArray(view.payload.topCitations)).toBe(true)
+  })
+})
+
+describe('⑦ alert：规则 CRUD + 手工基线触发事件', () => {
+  let ruleId = ''
+  let disposableRuleId = ''
+
+  it('新建一条 VISIBILITY_DROP 规则', async () => {
+    const res = await asShop(shopA).post('/api/admin/geo/alert-rules', {
+      brandId: brandA,
+      kind: 'VISIBILITY_DROP',
+      thresholdBp: 1000,
+      channels: ['INBOX'],
+    })
+    const rule = expectOk<{ id: string; thresholdBp: number; enabled: boolean }>(res.body)
+    ruleId = rule.id
+    expect(rule.thresholdBp).toBe(1000)
+    expect(rule.enabled).toBe(true)
+  })
+
+  it('列表能查到；改阈值；同品牌同类型不能建第二条活跃规则', async () => {
+    const list = await asShop(shopA).get('/api/admin/geo/alert-rules', { brandId: brandA })
+    const page = expectOk<{ items: Array<{ id: string }>; total: number }>(list.body)
+    expect(page.items.some((r) => r.id === ruleId)).toBe(true)
+
+    const updated = await asShop(shopA).put(`/api/admin/geo/alert-rules/${ruleId}`, {
+      thresholdBp: 2000,
+    })
+    expect(expectOk<{ thresholdBp: number }>(updated.body).thresholdBp).toBe(2000)
+
+    const dup = await asShop(shopA).post('/api/admin/geo/alert-rules', {
+      brandId: brandA,
+      kind: 'VISIBILITY_DROP',
+      thresholdBp: 500,
+    })
+    expect(codeOf(dup.body)).not.toBe(0)
+  })
+
+  it('建一条 NEGATIVE_MENTION 规则再删掉；events 目前是空的（没有基线，评估还没真的跑过）', async () => {
+    const created = await asShop(shopA).post('/api/admin/geo/alert-rules', {
+      brandId: brandA,
+      kind: 'NEGATIVE_MENTION',
+      thresholdBp: 3,
+    })
+    disposableRuleId = expectOk<{ id: string }>(created.body).id
+
+    const removed = await asShop(shopA).delete(`/api/admin/geo/alert-rules/${disposableRuleId}`)
+    expect(expectOk<{ id: string }>(removed.body).id).toBe(disposableRuleId)
+
+    const events = await asShop(shopA).get('/api/admin/geo/alert-events', { brandId: brandA })
+    expect(expectOk<{ total: number }>(events.body).total).toBe(0)
+  })
+
+  it('手工造一条"昨天"基线（提及率更高）+ 直调 handler → VISIBILITY_DROP 落事件', async () => {
+    const yesterdayKey = shiftKey(todayKey, -1)
+    await prisma.geoVisibilityDaily.create({
+      data: {
+        id: ulid(),
+        tenantId: shopA.tenantId,
+        brandId: brandA,
+        engineCode: '',
+        promptId: '',
+        date: dateKeyToDbDate(yesterdayKey),
+        answers: EXPECTED_RESULTS,
+        mentions: EXPECTED_RESULTS,
+        // 昨天 100%、今天也是 100%（见②）——两者相等本不该触发；把昨天硬造到
+        // 「今天的两倍基点」以上，才是一次真的"下降"，与规则的 2000bp 阈值拉开距离。
+        mentionRateBp: 20_000,
+        sovBp: 5_000,
+        avgPositionX100: 100,
+        citationRateBp: 10_000,
+        sentimentAvgX100: 0,
+        competitorStats: {},
+      },
+    })
+
+    const handler = app.get(GeoAlertEvaluateHandler)
+    const envelope: JobEnvelope<GeoAlertEvaluatePayload> = {
+      data: { brandId: brandA, date: todayKey },
+      originTenantId: shopA.tenantId,
+      traceId: ulid(),
+      enqueuedAt: Date.now(),
+    }
+    // 真队列消费时，BullMQ driver 会先按 envelope.originTenantId 开租户上下文再调
+    // process()（handler 内部全是 prisma.tenant.*）。这里绕过队列直调，得自己补上
+    // 同一层 runWithContext，否则 TenantScopeError。
+    await runWithContext(
+      { traceId: envelope.traceId, tenantId: shopA.tenantId, ip: { client: 'e2e', edge: 'e2e' }, startedAt: Date.now() },
+      () => handler.process(envelope),
+    )
+
+    const events = await asShop(shopA).get('/api/admin/geo/alert-events', { brandId: brandA })
+    const page = expectOk<{
+      items: Array<{ ruleId: string; kind: string; payload: Record<string, unknown> }>
+      total: number
+    }>(events.body)
+    expect(page.total).toBe(1)
+    expect(page.items[0]?.ruleId).toBe(ruleId)
+    expect(page.items[0]?.kind).toBe('VISIBILITY_DROP')
+
+    // 冷却起点已经写回规则；再调一次 handler 不应该在冷却期内重复触发。
+    const secondEnvelope = { ...envelope, traceId: ulid() }
+    await runWithContext(
+      { traceId: secondEnvelope.traceId, tenantId: shopA.tenantId, ip: { client: 'e2e', edge: 'e2e' }, startedAt: Date.now() },
+      () => handler.process(secondEnvelope),
+    )
+    const again = await asShop(shopA).get('/api/admin/geo/alert-events', { brandId: brandA })
+    expect(expectOk<{ total: number }>(again.body).total).toBe(1)
+  })
+})
+
+describe('⑧ platform：usage、runs 监控、重跑闸门', () => {
+  it('usage(平台)：byTenant 里有这家店，quantity/成本 > 0', async () => {
+    const res = await asPlatform().get('/api/platform/geo/usage')
+    const view = expectOk<{
+      byTenant: Array<{ tenantId: string; quantity: number; costCents: number }>
+    }>(res.body)
+    const row = view.byTenant.find((t) => t.tenantId === shopA.tenantId)
+    expect(row, `平台用量看板里没有这家店：${JSON.stringify(view.byTenant)}`).toBeTruthy()
+    expect(row!.quantity).toBeGreaterThan(0)
+  })
+
+  it('runs：按 tenantId 筛能看到这次跑批，状态 DONE', async () => {
+    const res = await asPlatform().get('/api/platform/geo/runs', { tenantId: shopA.tenantId })
+    const page = expectOk<{ items: Array<{ id: string; status: string }> }>(res.body)
+    const row = page.items.find((r) => r.id === runA)
+    expect(row).toBeTruthy()
+    expect(row?.status).toBe('DONE')
+  })
+
+  it('retry：DONE 且没有失败结果时拒绝重跑（不产生新任务）', async () => {
+    const res = await asPlatform().post(`/api/platform/geo/runs/${runA}/retry`)
+    expect(codeOf(res.body)).not.toBe(0)
+    expect(messageOf(res.body)).toContain('没有失败')
+  })
+})
+
+describe('⑨ 配额：套餐 GEO_BRAND = 1 时不能再建第二个品牌', () => {
+  it('POST /geo/brands 被拒绝，品牌数不变', async () => {
+    const planId = await createPlan({ GEO_BRAND: 1 })
+    await mutateTenant(shopA.tenantId, {
+      planId,
+      status: 'ACTIVE',
+      planExpireAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      trialEndAt: null,
+    })
+
+    const before = await prisma.geoBrand.count({ where: { tenantId: shopA.tenantId } })
+    const res = await asShop(shopA).post('/api/admin/geo/brands', {
+      name: `钛赞云第二品牌 ${RUN}`,
+      domain: `second-${BRAND_DOMAIN}`,
+      engineCodes: ['mock'],
+      sampleSize: 1,
+    })
+    expect(codeOf(res.body)).not.toBe(0)
+    const after = await prisma.geoBrand.count({ where: { tenantId: shopA.tenantId } })
+    expect(after).toBe(before)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 本文件专用的小工具（只在这份 e2e 里用，没有必要挪进纯函数库）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `YYYY-MM-DD` 加/减 n 天，UTC 对齐（与 `geo-metrics.rules.ts` 的 `shiftDateKey` 同一套坐标）。 */
+function shiftKey(dateKey: string, days: number): string {
+  const d = new Date(`${dateKey}T00:00:00.000Z`)
+  d.setUTCDate(d.getUTCDate() + days)
+  return d.toISOString().slice(0, 10)
+}
+
+/** 含 `dateKey` 那一周的周一（`0`=周日）。只用来给 `GenerateGeoReportDto.periodStart` 传值。 */
+function mondayOfWeekContaining(dateKey: string): string {
+  const dow = new Date(`${dateKey}T00:00:00.000Z`).getUTCDay()
+  const backToMonday = dow === 0 ? 6 : dow - 1
+  return shiftKey(dateKey, -backToMonday)
+}

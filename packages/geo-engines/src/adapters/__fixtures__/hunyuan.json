@@ -1,0 +1,31 @@
+{
+  "id": "mock-hunyuan-0001",
+  "object": "chat.completion",
+  "created": 1789000001,
+  "model": "hunyuan-turbos-latest",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "目前国内可选的 GEO 监测工具有泰赞GEO、新榜智汇等。"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "search_info": {
+    "search_results": [
+      {
+        "index": 1,
+        "title": "泰赞 GEO",
+        "url": "https://www.example.org/geo",
+        "site_name": "泰赞"
+      }
+    ]
+  },
+  "usage": {
+    "prompt_tokens": 88,
+    "completion_tokens": 176,
+    "total_tokens": 264
+  }
+}

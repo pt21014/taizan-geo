@@ -1,0 +1,186 @@
+/**
+ * `geo-prompt.rules.ts` 的单测。
+ *
+ * `hashPromptText` 定义的是一个**落库的唯一索引列**的口径，所以它的每一条归一化步骤
+ * 都单独有用例——改了其中任何一条，这里必红，而那正是"存量行要重算"的信号。
+ *
+ * @packageDocumentation
+ */
+
+import { createHash } from 'node:crypto'
+
+import { describe, expect, it } from 'vitest'
+
+import {
+  DEFAULT_PROMPT_SET_NAME,
+  dedupePrompts,
+  GEO_PROMPT_TEXT_MAX,
+  hashPromptText,
+  normalizeFunnelStage,
+  normalizePromptSetName,
+  normalizePromptText,
+  validatePromptInput,
+  validatePromptPatch,
+  validatePromptSetInput,
+} from './geo-prompt.rules'
+
+describe('normalizePromptText', () => {
+  it('trim + 压空白 + 转小写', () => {
+    expect(normalizePromptText('  Taizan   好用吗  ')).toBe('{{projectSlug}} 好用吗')
+  })
+
+  it('换行与制表符也算空白', () => {
+    expect(normalizePromptText('太赞\n\t好用吗')).toBe('太赞 好用吗')
+  })
+
+  it('刻意不删标点（带问号与不带问号是两个观测点）', () => {
+    expect(normalizePromptText('太赞好用吗？')).toBe('太赞好用吗？')
+    expect(normalizePromptText('太赞好用吗？')).not.toBe(normalizePromptText('太赞好用吗'))
+  })
+
+  it('非字符串归零', () => {
+    expect(normalizePromptText(undefined)).toBe('')
+    expect(normalizePromptText(123)).toBe('')
+  })
+})
+
+describe('hashPromptText', () => {
+  it('是归一化正文的 sha256 十六进制（64 字符）', () => {
+    const hash = hashPromptText('  Taizan   好用吗 ')
+    expect(hash).toHaveLength(64)
+    expect(hash).toBe(createHash('sha256').update('{{projectSlug}} 好用吗', 'utf8').digest('hex'))
+  })
+
+  it('只差空白/大小写的两条算同一条', () => {
+    expect(hashPromptText('太赞 好用吗')).toBe(hashPromptText('  太赞   好用吗  '))
+    expect(hashPromptText('Taizan 好用吗')).toBe(hashPromptText('{{projectSlug}} 好用吗'))
+  })
+
+  it('正文不同则指纹不同', () => {
+    expect(hashPromptText('太赞好用吗')).not.toBe(hashPromptText('太赞贵吗'))
+  })
+
+  it('空输入也有确定的指纹（不抛错）', () => {
+    expect(hashPromptText('')).toHaveLength(64)
+    expect(hashPromptText(undefined)).toBe(hashPromptText(''))
+  })
+})
+
+describe('dedupePrompts', () => {
+  it('输入内部去重，保留首次出现的原始写法（不小写化）', () => {
+    const { kept, skipped } = dedupePrompts(['Taizan 好用吗', '{{projectSlug}}  好用吗'])
+    expect(kept.map((p) => p.text)).toEqual(['Taizan 好用吗'])
+    expect(skipped).toBe(1)
+  })
+
+  it('命中库里已有的指纹算 skipped', () => {
+    const existing = new Set([hashPromptText('太赞好用吗')])
+    const { kept, skipped } = dedupePrompts(['太赞好用吗', '太赞贵吗'], existing)
+    expect(kept.map((p) => p.text)).toEqual(['太赞贵吗'])
+    expect(skipped).toBe(1)
+  })
+
+  it('空行不计进 skipped（否则"跳过 3 条"里会混进空行）', () => {
+    const { kept, skipped } = dedupePrompts(['太赞好用吗', '', '   ', '\n'])
+    expect(kept).toHaveLength(1)
+    expect(skipped).toBe(0)
+  })
+
+  it('非字符串项计进 skipped', () => {
+    const { kept, skipped } = dedupePrompts(['太赞好用吗', 42, null])
+    expect(kept).toHaveLength(1)
+    expect(skipped).toBe(2)
+  })
+
+  it('每条产出都带与正文一致的指纹', () => {
+    const { kept } = dedupePrompts([' 太赞好用吗 '])
+    expect(kept[0]?.text).toBe('太赞好用吗')
+    expect(kept[0]?.textHash).toBe(hashPromptText('太赞好用吗'))
+  })
+
+  it('空输入 → 空产出', () => {
+    expect(dedupePrompts([])).toEqual({ kept: [], skipped: 0 })
+  })
+})
+
+describe('normalizeFunnelStage', () => {
+  it('大小写不敏感', () => {
+    expect(normalizeFunnelStage('tofu')).toBe('TOFU')
+    expect(normalizeFunnelStage(' MoFu ')).toBe('MOFU')
+    expect(normalizeFunnelStage('BOFU')).toBe('BOFU')
+  })
+
+  it('认不出来的一律 UNKNOWN，而不是抛错（一整批导入不该因为一个标签失败）', () => {
+    expect(normalizeFunnelStage('漏斗顶')).toBe('UNKNOWN')
+    expect(normalizeFunnelStage(undefined)).toBe('UNKNOWN')
+    expect(normalizeFunnelStage(null)).toBe('UNKNOWN')
+    expect(normalizeFunnelStage(7)).toBe('UNKNOWN')
+  })
+})
+
+describe('validatePromptInput', () => {
+  const ok = { text: '太赞好用吗', topic: '口碑', funnelStage: 'BOFU', isTracked: true, priority: 10 }
+
+  it('一条合法输入零违规', () => {
+    expect(validatePromptInput(ok)).toEqual([])
+  })
+
+  it('正文必填、过短、过长都被拦', () => {
+    expect(validatePromptInput({ ...ok, text: undefined }).map((v) => v.field)).toEqual(['text'])
+    expect(validatePromptInput({ ...ok, text: '好' }).map((v) => v.field)).toEqual(['text'])
+    expect(
+      validatePromptInput({ ...ok, text: '好'.repeat(GEO_PROMPT_TEXT_MAX + 1) }).map((v) => v.field),
+    ).toEqual(['text'])
+  })
+
+  it('正文正好到上限放行', () => {
+    expect(validatePromptInput({ ...ok, text: '好'.repeat(GEO_PROMPT_TEXT_MAX) })).toEqual([])
+  })
+
+  it('优先级越界被拦', () => {
+    expect(validatePromptInput({ ...ok, priority: -1 }).map((v) => v.field)).toEqual(['priority'])
+    expect(validatePromptInput({ ...ok, priority: 101 }).map((v) => v.field)).toEqual(['priority'])
+  })
+
+  it('isTracked 类型不对被拦', () => {
+    expect(validatePromptInput({ ...ok, isTracked: 'yes' }).map((v) => v.field)).toEqual([
+      'isTracked',
+    ])
+  })
+
+  it('funnelStage 再离谱也不产生违规（归一化兜住了）', () => {
+    expect(validatePromptInput({ ...ok, funnelStage: '漏斗顶' })).toEqual([])
+  })
+})
+
+describe('validatePromptPatch', () => {
+  it('空 patch 零违规', () => {
+    expect(validatePromptPatch({})).toEqual([])
+  })
+
+  it('给了就校验', () => {
+    expect(validatePromptPatch({ text: '好' }).map((v) => v.field)).toEqual(['text'])
+  })
+})
+
+describe('validatePromptSetInput / normalizePromptSetName', () => {
+  it('名称归一', () => {
+    expect(normalizePromptSetName('  核心   问法 ')).toBe('核心 问法')
+  })
+
+  it('默认集名是一个常量（两处各写一份会每次都新建一个）', () => {
+    expect(DEFAULT_PROMPT_SET_NAME).toBe('默认')
+    expect(validatePromptSetInput({ name: DEFAULT_PROMPT_SET_NAME })).toEqual([])
+  })
+
+  it('名称为空被拦', () => {
+    expect(validatePromptSetInput({ name: '   ' }).map((v) => v.field)).toEqual(['name'])
+  })
+
+  it('来源只认枚举字面量', () => {
+    expect(validatePromptSetInput({ name: 'x', source: 'MANUAL' })).toEqual([])
+    expect(validatePromptSetInput({ name: 'x', source: 'ROBOT' }).map((v) => v.field)).toEqual([
+      'source',
+    ])
+  })
+})

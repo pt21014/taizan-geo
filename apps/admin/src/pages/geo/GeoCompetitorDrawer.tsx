@@ -1,0 +1,133 @@
+import { Drawer } from 'antd'
+import { Form, Input, Select } from 'antd'
+import {
+  CrudDrawerForm,
+  CrudTable,
+  textColumn,
+  useCrudForm,
+  useCrudTable,
+} from '@taizan/admin-ui'
+import type { PageResult } from '@taizan/contracts'
+import {
+  useGeoBrandApi,
+  type GeoBrand,
+  type GeoCompetitor,
+  type GeoCompetitorInput,
+} from '../../api/geo-brand'
+
+/**
+ * 某个品牌的「竞品」子抽屉：一张小 CrudTable + 一个更小的表单抽屉。
+ *
+ * ## 为什么竞品不是一个独立页面
+ *
+ * 竞品脱离品牌没有意义——它是份额 SoV 的分母，只在解析"这个品牌的回答"时被一起
+ * 识别出来。做成独立页面的话，运营进去第一件事还是要选一个品牌，而那就是这个抽屉
+ * 在做的事，只是多了一次跳转。
+ *
+ * ## 两层抽屉是刻意的
+ *
+ * 外层是竞品**列表**（看全 10 条、删一条），内层是竞品**表单**（改一条）。
+ * 合成一层的话，"改第 3 条"要么原地变成可编辑表格（antd 的可编辑表格在有校验时
+ * 很难用），要么把列表挤掉——而运营改一条竞品之前，通常要先看一眼另外九条是什么。
+ */
+export function GeoCompetitorDrawer({
+  brand,
+  open,
+  onClose,
+}: {
+  /** 正在看哪个品牌的竞品；`null` 时不渲染内容（抽屉关闭动画期间会是这个状态） */
+  brand: GeoBrand | null
+  open: boolean
+  onClose: () => void
+}) {
+  const api = useGeoBrandApi()
+  const brandId = brand?.id ?? ''
+
+  const table = useCrudTable<GeoCompetitor>({
+    // 竞品接口返回的是**数组**而不是 `PageResult`（上限只有 10 条，分页没有意义）。
+    // 这里包成 `PageResult` 而不是给后端加一层分页：分页的代价是前端要处理翻页、
+    // 后端要处理 skip/take，而它们在一个 10 条上限的列表上永远不会被触发。
+    list: async (): Promise<PageResult<GeoCompetitor>> => {
+      if (brandId === '') return { items: [], total: 0, page: 1, pageSize: 10 }
+      const items = await api.listCompetitors(brandId)
+      return { items, total: items.length, page: 1, pageSize: Math.max(items.length, 10) }
+    },
+    remove: (row) => api.removeCompetitor(brandId, row.id).then(() => undefined),
+    rowKey: 'id',
+    // 刻意**不开** `syncUrl`：这是一个抽屉里的表，把它的分页写进地址栏会让
+    // 刷新页面之后地址栏带着一堆与主列表无关的参数。
+  })
+
+  const form = useCrudForm<GeoCompetitorInput>({
+    create: (values) => api.createCompetitor(brandId, values),
+    update: (id, values) => api.updateCompetitor(brandId, id, values),
+    onSuccess: table.refresh,
+  })
+
+  return (
+    <Drawer
+      title={brand === null ? '竞品' : `竞品 · ${brand.name}`}
+      width={720}
+      open={open}
+      onClose={onClose}
+      destroyOnClose
+    >
+      <CrudTable<GeoCompetitor>
+        table={table}
+        size="small"
+        emptyText="还没有竞品。加上竞品之后，报表里才有「份额」这一列。"
+        create={{
+          label: '新增竞品',
+          perm: 'geo-brand:write',
+          onClick: () => form.openForm(),
+        }}
+        columns={[
+          { title: '竞品名', dataIndex: 'name', key: 'name' },
+          textColumn({ title: '域名', dataIndex: 'domain', width: 200 }),
+          {
+            title: '别名',
+            key: 'aliases',
+            render: (_value: unknown, row: GeoCompetitor) =>
+              row.aliases.length === 0 ? '-' : row.aliases.join('、'),
+          },
+        ]}
+        actions={[
+          {
+            key: 'edit',
+            label: '编辑',
+            perm: 'geo-brand:write',
+            onClick: (row) =>
+              form.openWith(row.id, {
+                name: row.name,
+                domain: row.domain ?? '',
+                aliases: row.aliases,
+              }),
+          },
+          {
+            key: 'del',
+            label: '删除',
+            perm: 'geo-brand:write',
+            danger: true,
+            confirm: (row) => `确定删除竞品「${row.name}」？历史报表里的份额口径会随之改变。`,
+            onClick: (row) => void table.removeRow(row),
+          },
+        ]}
+      />
+      <CrudDrawerForm form={form} title="竞品" width={460}>
+        <Form.Item name="name" label="竞品名" rules={[{ required: true, message: '请填竞品名' }]}>
+          <Input placeholder="如：某某科技" />
+        </Form.Item>
+        <Form.Item
+          name="domain"
+          label="官网域名"
+          tooltip="填了之后，回答里引用这个域名的链接会被判成「竞品阵地」"
+        >
+          <Input placeholder="如：example.com（协议和 www 会自动去掉）" />
+        </Form.Item>
+        <Form.Item name="aliases" label="别名" tooltip="回车分隔；提及识别时会一起匹配">
+          <Select mode="tags" tokenSeparators={[',', '，']} placeholder="简称、英文名…" />
+        </Form.Item>
+      </CrudDrawerForm>
+    </Drawer>
+  )
+}

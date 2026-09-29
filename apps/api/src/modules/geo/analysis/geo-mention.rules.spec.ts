@@ -1,0 +1,287 @@
+/**
+ * `geo-mention.rules.ts` 的单测。
+ *
+ * @packageDocumentation
+ */
+import { describe, expect, it } from 'vitest'
+
+import {
+  extractMentionsFallback,
+  markCited,
+  mergeLlmMentions,
+  normalizeSentimentScore,
+  sentimentFromScore,
+  type EntityDef,
+  type MentionDraft,
+} from './geo-mention.rules'
+
+const brand: EntityDef = { kind: 'BRAND', name: '太赞科技', aliases: ['太赞', 'Taizan'] }
+const compA: EntityDef = { kind: 'COMPETITOR', id: 'c1', name: '竞品甲', aliases: [] }
+const compB: EntityDef = { kind: 'COMPETITOR', id: 'c2', name: '竞品乙', aliases: ['乙品牌'] }
+
+describe('extractMentionsFallback', () => {
+  it('按首次出现顺序排 position', () => {
+    const out = extractMentionsFallback('比较推荐竞品乙，其次是太赞科技，最后是竞品甲。', [brand, compA, compB])
+    expect(out.map((m) => m.entityName)).toEqual(['竞品乙', '太赞科技', '竞品甲'])
+    expect(out.map((m) => m.position)).toEqual([1, 2, 3])
+  })
+
+  it('没出现的实体不产出', () => {
+    const out = extractMentionsFallback('只提到了太赞科技。', [brand, compA])
+    expect(out).toHaveLength(1)
+    expect(out[0]?.entityName).toBe('太赞科技')
+  })
+
+  it('空文本/空实体列表 → 空数组', () => {
+    expect(extractMentionsFallback('', [brand])).toEqual([])
+    expect(extractMentionsFallback('太赞科技很好', [])).toEqual([])
+  })
+
+  it('大小写不敏感匹配别名', () => {
+    const out = extractMentionsFallback('TAIZAN 是个不错的选择', [brand])
+    expect(out).toHaveLength(1)
+    expect(out[0]?.entityName).toBe('太赞科技')
+  })
+
+  it('全角字符归一化后可以匹配（Ａ→A）', () => {
+    const fullWidthBrand: EntityDef = { kind: 'BRAND', name: 'ABC', aliases: [] }
+    const out = extractMentionsFallback('这里提到了 Ａｂｃ 品牌', [fullWidthBrand])
+    expect(out).toHaveLength(1)
+  })
+
+  it('产出固定字段：NEUTRAL / 0 分 / isCited=false', () => {
+    const out = extractMentionsFallback('太赞科技不错', [brand])
+    expect(out[0]).toMatchObject({ sentiment: 'NEUTRAL', sentimentScore: 0, isCited: false })
+  })
+
+  it('竞品命中带上 competitorId', () => {
+    const out = extractMentionsFallback('竞品甲还可以', [compA])
+    expect(out[0]?.competitorId).toBe('c1')
+  })
+
+  it('snippet 取命中处前后各 60 字，且不超出正文边界', () => {
+    const text = '太赞科技'
+    const out = extractMentionsFallback(text, [brand])
+    expect(out[0]?.snippet).toBe(text)
+  })
+
+  it('别名列表里混入非字符串/空串不报错', () => {
+    const dirty: EntityDef = {
+      kind: 'BRAND',
+      name: '太赞科技',
+      aliases: ['', '   ', null as unknown as string, 'Taizan'],
+    }
+    const out = extractMentionsFallback('Taizan 很好', [dirty])
+    expect(out).toHaveLength(1)
+  })
+})
+
+describe('normalizeSentimentScore', () => {
+  it('夹到 -100..100', () => {
+    expect(normalizeSentimentScore(150)).toBe(100)
+    expect(normalizeSentimentScore(-150)).toBe(-100)
+  })
+
+  it('边界值原样保留', () => {
+    expect(normalizeSentimentScore(100)).toBe(100)
+    expect(normalizeSentimentScore(-100)).toBe(-100)
+    expect(normalizeSentimentScore(0)).toBe(0)
+  })
+
+  it('四舍五入取整', () => {
+    expect(normalizeSentimentScore(12.6)).toBe(13)
+    expect(normalizeSentimentScore(12.4)).toBe(12)
+  })
+
+  it('非数字 → 0', () => {
+    expect(normalizeSentimentScore('50')).toBe(0)
+    expect(normalizeSentimentScore(undefined)).toBe(0)
+    expect(normalizeSentimentScore(Number.NaN)).toBe(0)
+  })
+})
+
+describe('sentimentFromScore', () => {
+  it('> 20 → POSITIVE，边界 20 本身是 NEUTRAL', () => {
+    expect(sentimentFromScore(21)).toBe('POSITIVE')
+    expect(sentimentFromScore(20)).toBe('NEUTRAL')
+  })
+
+  it('< -20 → NEGATIVE，边界 -20 本身是 NEUTRAL', () => {
+    expect(sentimentFromScore(-21)).toBe('NEGATIVE')
+    expect(sentimentFromScore(-20)).toBe('NEUTRAL')
+  })
+
+  it('0 → NEUTRAL', () => {
+    expect(sentimentFromScore(0)).toBe('NEUTRAL')
+  })
+})
+
+describe('mergeLlmMentions', () => {
+  const fallback: MentionDraft[] = [
+    {
+      entityKind: 'BRAND',
+      entityName: '太赞科技',
+      position: 1,
+      isCited: false,
+      sentiment: 'NEUTRAL',
+      sentimentScore: 0,
+      snippet: 'fallback',
+    },
+  ]
+
+  it('正常结构化输出：按实体对齐并替换成权威名字', () => {
+    const llm = {
+      mentions: [{ entityName: 'taizan', position: 2, isCited: true, sentiment: 'POSITIVE', sentimentScore: 80, snippet: 's' }],
+    }
+    const out = mergeLlmMentions(llm, [brand], fallback)
+    expect(out).toHaveLength(1)
+    expect(out[0]).toMatchObject({
+      entityKind: 'BRAND',
+      entityName: '太赞科技',
+      position: 2,
+      isCited: true,
+      sentiment: 'POSITIVE',
+      sentimentScore: 80,
+    })
+  })
+
+  it('接受字符串形式的 JSON', () => {
+    const out = mergeLlmMentions(
+      JSON.stringify({ mentions: [{ entityName: '太赞科技', position: 1 }] }),
+      [brand],
+      fallback,
+    )
+    expect(out).toHaveLength(1)
+  })
+
+  it('JSON 解析失败 → 回退 fallback', () => {
+    expect(mergeLlmMentions('{not valid json', [brand], fallback)).toBe(fallback)
+  })
+
+  it('不是对象 / 没有 mentions 数组 → 回退 fallback', () => {
+    expect(mergeLlmMentions(null, [brand], fallback)).toBe(fallback)
+    expect(mergeLlmMentions({}, [brand], fallback)).toBe(fallback)
+    expect(mergeLlmMentions({ mentions: 'nope' }, [brand], fallback)).toBe(fallback)
+  })
+
+  it('mentions 为空数组 → 回退 fallback', () => {
+    expect(mergeLlmMentions({ mentions: [] }, [brand], fallback)).toBe(fallback)
+  })
+
+  it('entityName 对不上实体表 → 丢弃该条；全部丢弃后回退 fallback', () => {
+    const out = mergeLlmMentions({ mentions: [{ entityName: '不存在的实体', position: 1 }] }, [brand], fallback)
+    expect(out).toBe(fallback)
+  })
+
+  it('部分对不上：丢弃对不上的，保留对得上的', () => {
+    const out = mergeLlmMentions(
+      { mentions: [{ entityName: '不存在的实体' }, { entityName: '太赞科技', position: 1 }] },
+      [brand],
+      fallback,
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.entityName).toBe('太赞科技')
+  })
+
+  it('同一实体出现多条：保留最小 position', () => {
+    const out = mergeLlmMentions(
+      {
+        mentions: [
+          { entityName: '太赞科技', position: 5 },
+          { entityName: '太赞科技', position: 2 },
+          { entityName: '太赞科技', position: 8 },
+        ],
+      },
+      [brand],
+      fallback,
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.position).toBe(2)
+  })
+
+  it('输出按 position 升序排列', () => {
+    const out = mergeLlmMentions(
+      {
+        mentions: [
+          { entityName: '竞品甲', position: 3 },
+          { entityName: '太赞科技', position: 1 },
+        ],
+      },
+      [brand, compA],
+      fallback,
+    )
+    expect(out.map((m) => m.entityName)).toEqual(['太赞科技', '竞品甲'])
+  })
+
+  it('字段缺失/类型错也不报错：position 非法排到最后，sentiment 非法用分数兜底', () => {
+    const out = mergeLlmMentions(
+      { mentions: [{ entityName: '太赞科技', position: 'abc', sentiment: 'weird', sentimentScore: 50 }] },
+      [brand],
+      fallback,
+    )
+    expect(out[0]?.sentiment).toBe('POSITIVE') // 50 分对应 POSITIVE
+    expect(out[0]?.position).toBe(Number.MAX_SAFE_INTEGER)
+  })
+
+  it('竞品匹配带上 competitorId', () => {
+    const out = mergeLlmMentions({ mentions: [{ entityName: '乙品牌', position: 1 }] }, [compB], fallback)
+    expect(out[0]?.competitorId).toBe('c2')
+  })
+})
+
+describe('markCited', () => {
+  const mentions: MentionDraft[] = [
+    {
+      entityKind: 'BRAND',
+      entityName: '太赞科技',
+      position: 1,
+      isCited: false,
+      sentiment: 'NEUTRAL',
+      sentimentScore: 0,
+      snippet: '',
+    },
+    {
+      entityKind: 'COMPETITOR',
+      competitorId: 'c1',
+      entityName: '竞品甲',
+      position: 2,
+      isCited: false,
+      sentiment: 'NEUTRAL',
+      sentimentScore: 0,
+      snippet: '',
+    },
+  ]
+
+  it('品牌域名命中 → isCited=true', () => {
+    const out = markCited(mentions, [{ domain: 'example.org' }], 'example.org', {})
+    expect(out[0]?.isCited).toBe(true)
+    expect(out[1]?.isCited).toBe(false)
+  })
+
+  it('子域命中主域', () => {
+    const out = markCited(mentions, [{ domain: 'shop.example.org' }], 'example.org', {})
+    expect(out[0]?.isCited).toBe(true)
+  })
+
+  it('竞品域名命中对应 competitorId', () => {
+    const out = markCited(mentions, [{ domain: 'competitor-a.com' }], 'example.org', { c1: 'competitor-a.com' })
+    expect(out[1]?.isCited).toBe(true)
+    expect(out[0]?.isCited).toBe(false)
+  })
+
+  it('空引用列表 → 全部 isCited=false', () => {
+    const out = markCited(mentions, [], 'example.org', { c1: 'competitor-a.com' })
+    expect(out.every((m) => m.isCited === false)).toBe(true)
+  })
+
+  it('未命中且原值已是 false 时返回同一个对象引用（不产生无意义的新对象）', () => {
+    const out = markCited(mentions, [], undefined, {})
+    expect(out[0]).toBe(mentions[0])
+    expect(out[1]).toBe(mentions[1])
+  })
+
+  it('brandDomain 缺失时品牌提及不会被误判命中', () => {
+    const out = markCited(mentions, [{ domain: 'example.org' }], undefined, {})
+    expect(out[0]?.isCited).toBe(false)
+  })
+})

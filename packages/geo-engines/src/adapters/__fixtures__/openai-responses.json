@@ -1,0 +1,51 @@
+{
+  "id": "resp_67ccf18ef5fc8190b16dbee19bc54e5f",
+  "object": "response",
+  "created_at": 1789000006,
+  "status": "completed",
+  "model": "gpt-4.1-mini-2025-04-14",
+  "output": [
+    {
+      "id": "ws_67ccf18f64008190a1a5a1b0d1b0d1b0",
+      "type": "web_search_call",
+      "status": "completed",
+      "action": {
+        "type": "search",
+        "query": "GEO monitoring tools China"
+      }
+    },
+    {
+      "id": "msg_67ccf190ca3881909d433c50b1f6357e",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Popular GEO monitoring tools include Taizan GEO and Newrank Zhihui.",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "start_index": 41,
+              "end_index": 52,
+              "url": "https://www.example.org/geo?utm_source=openai",
+              "title": "Taizan GEO"
+            },
+            {
+              "type": "url_citation",
+              "start_index": 57,
+              "end_index": 73,
+              "url": "https://geo.newrank.cn/",
+              "title": "Newrank Zhihui"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 328,
+    "output_tokens": 96,
+    "total_tokens": 424
+  }
+}

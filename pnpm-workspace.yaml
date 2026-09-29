@@ -1,0 +1,16 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+  - 'tools/*'
+allowBuilds:
+  '@parcel/watcher': true
+  '@prisma/client': true
+  '@prisma/engines': true
+  '@scarf/scarf': false
+  '@swc/core': true
+  '@tarojs/binding': true
+  core-js: true
+  core-js-pure: true
+  esbuild: true
+  msgpackr-extract: false # bullmq 的可选原生加速器，CI 上不编译；pnpm 11 未登记会直接报错
+  prisma: true

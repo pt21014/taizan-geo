@@ -1,0 +1,377 @@
+/**
+ * 监测品牌的**业务规则纯函数**（蓝图 §9「商业规则纯函数 + 单测」，GEO P0 技术设计 §4.4）。
+ *
+ * ## 为什么单独一个文件
+ *
+ * 规则写在 service 里就只能靠起 Nest + 连库才能测，于是实际上没人测边界值。
+ * 抽成不碰数据库、不读时钟、不 import `@nestjs/*` 的纯函数之后，
+ * `geo-brand.rules.spec.ts` 可以把每条边界都过一遍（域名带协议、别名全是空格、
+ * 采样次数 0 或 11……），而这些恰恰是运营真的会踩到的输入。
+ *
+ * **不要往这里 import 任何 `@nestjs/*` 或 `@prisma/client`**：一旦引入，它就不再是
+ * 纯函数，单测就要起容器，于是边界用例又会慢慢消失。
+ *
+ * @packageDocumentation
+ */
+
+/** 品牌状态（与 `prisma/schema/10-business/20-geo.prisma` 的 `GeoBrandStatus` 一一对应）。 */
+export type GeoBrandStatusLike = 'ACTIVE' | 'PAUSED'
+
+/** 合法状态全集，供 DTO 校验与本文件共用（两处各写一份必然会漂）。 */
+export const GEO_BRAND_STATUSES: readonly GeoBrandStatusLike[] = ['ACTIVE', 'PAUSED']
+
+/** 刷新频率（与 `GeoRefreshFreq` 一一对应）。 */
+export type GeoRefreshFreqLike = 'WEEKLY' | 'DAILY'
+
+/** 合法刷新频率全集。 */
+export const GEO_REFRESH_FREQS: readonly GeoRefreshFreqLike[] = ['WEEKLY', 'DAILY']
+
+/** 品牌名最大长度（字符数，不是字节）。 */
+export const GEO_BRAND_NAME_MAX = 60
+
+/** 域名最大长度，与 `GeoBrand.domain @db.VarChar(255)` 对齐。 */
+export const GEO_BRAND_DOMAIN_MAX = 255
+
+/** 别名条数上限。别名是要逐条拿去做提及匹配的，条数失控等于每次解析都慢一截。 */
+export const GEO_BRAND_ALIAS_MAX = 20
+
+/** 单条别名的最大长度。 */
+export const GEO_BRAND_ALIAS_LENGTH_MAX = 60
+
+/** 采样次数下限 / 上限。生成式回答有随机性，1 次不可信；上限挡住「填 1000 把配额烧光」。 */
+export const GEO_SAMPLE_SIZE_MIN = 1
+export const GEO_SAMPLE_SIZE_MAX = 10
+
+/** 引擎 code 条数上限。 */
+export const GEO_BRAND_ENGINE_MAX = 20
+
+/**
+ * 一个品牌下的竞品数上限。
+ *
+ * P0 用常量而不是配额档：竞品不消耗 `QuotaKind`（它不是卖点，是"对照组"），
+ * 但份额 SoV 的分母是竞品数，无限加下去会让每条回答的解析成本线性上涨，
+ * 而运营不会察觉——他只看到"跑批变慢了"。
+ *
+ * TODO(T7)：如果平台真的想把"竞品数"做成套餐卖点，这里换成
+ * `quota.check('GEO_COMPETITOR', ...)`，常量降级成兜底上限。
+ */
+export const MAX_COMPETITORS = 10
+
+/** 语言/地区默认值。同一个品牌在不同地区的可见度是两回事，缺省必须显式定死一个。 */
+export const GEO_DEFAULT_LOCALE = 'zh-CN'
+
+/** 语言/地区列长度上限，与 `GeoBrand.locale @db.VarChar(16)` 对齐。 */
+export const GEO_LOCALE_MAX = 16
+
+/** 行业名长度上限。 */
+export const GEO_INDUSTRY_MAX = 60
+
+/** 一条校验结论。 */
+export interface RuleViolation {
+  /** 出问题的字段名，与 DTO 字段同名，便于前端定位到输入框。 */
+  field: string
+  /** 给人看的中文说明。 */
+  message: string
+}
+
+/** 校验入参（新建时字段齐全，修改时可缺）。 */
+export interface GeoBrandInput {
+  name?: unknown
+  domain?: unknown
+  aliases?: unknown
+  industry?: unknown
+  locale?: unknown
+  status?: unknown
+  refreshFreq?: unknown
+  sampleSize?: unknown
+  engineCodes?: unknown
+}
+
+/**
+ * 名称归一：去首尾空白、把连续空白压成一个。
+ *
+ * 压空白不是洁癖：`"太赞  科技"` 与 `"太赞 科技"` 在唯一索引看来是两条不同的记录，
+ * 而在人看来是同一个品牌。不归一的话「重名检查」会被一个多打的空格绕过去，
+ * 于是同一个品牌被建成两份、各自跑批、各自计费。
+ */
+export function normalizeBrandName(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  return raw.trim().replace(/\s+/g, ' ')
+}
+
+/**
+ * 域名归一：去协议、去 `www.`、去路径与末尾斜杠、转小写。
+ *
+ * 这一列是「这条引用算不算自有阵地」的判据（`classifySource` 在 T5 要拿它比对
+ * 引用 URL 的 host）。运营粘进来的通常是 `https://www.example.org/` 这种整条地址，
+ * 不归一的话比对永远不相等，表现是「自家官网被算成第三方来源」——
+ * 而那正是这个产品要给出的核心结论之一。
+ *
+ * @param raw - 原始输入，允许是 `undefined` / `null` / 空串（品牌可以没有官网）
+ * @returns 归一后的主域名；输入为空或不是字符串时返回 `null`
+ */
+export function normalizeDomain(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  let value = raw.trim().toLowerCase()
+  if (value === '') return null
+  // 协议：`https://` / `http://` / 协议相对的 `//`
+  value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').replace(/^\/\//, '')
+  // 认证信息 `user:pass@`
+  value = value.replace(/^[^/@]*@/, '')
+  // 路径 / query / hash：第一个 `/`、`?`、`#` 之后的一切
+  value = value.split(/[/?#]/)[0] ?? ''
+  // 端口
+  value = value.split(':')[0] ?? ''
+  // www. 前缀。只削一层——`www.www.x.com` 是个错的输入，不该被悄悄"修好"。
+  value = value.replace(/^www\./, '')
+  // 末尾点（DNS 的 FQDN 写法 `example.org.`）
+  value = value.replace(/\.+$/, '')
+  return value === '' ? null : value
+}
+
+/**
+ * 别名归一：逐条 trim、丢掉空串、按**大小写不敏感**去重，保留首次出现的原始大小写。
+ *
+ * 大小写不敏感去重的理由：`["Taizan","taizan"]` 在提及匹配时命中的是同一批文本，
+ * 留两条只会让 SoV 的分母虚高。保留首次出现的写法则是为了让运营在列表里
+ * 看到的还是自己填的那个（品牌名的大小写通常是有讲究的）。
+ *
+ * @param raw - 原始输入，非数组一律当成空数组
+ */
+export function normalizeAliases(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const alias = item.trim().replace(/\s+/g, ' ')
+    if (alias === '') continue
+    const key = alias.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(alias)
+  }
+  return out
+}
+
+/**
+ * 引擎 code 归一：转小写、trim、去空、去重。
+ *
+ * **P0 不校验 code 是否真的存在**：引擎清单是平台域表（`GeoEngine`），
+ * 而这是一个纯函数，读不到库。存在性校验留给引擎服务。
+ *
+ * TODO(T5/T6)：`GeoEngineService.assertCodesExist(codes)` 落地后，在
+ * `geo-brand.service.ts` 的 create/update 里调它——填了一个不存在的 code 的现象是
+ * 「跑批时这个引擎悄悄被跳过」，而运营以为自己在监测它。
+ */
+export function normalizeEngineCodes(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const code = item.trim().toLowerCase()
+    if (code === '') continue
+    if (seen.has(code)) continue
+    seen.add(code)
+    out.push(code)
+  }
+  return out
+}
+
+/**
+ * 新建时的完整校验。
+ *
+ * 校验的是**生效之后**的输入（默认值已经填好），不是原始 DTO——
+ * 把 `undefined` 直接喂进来会被判成「必填没填」，而 `locale` / `sampleSize` 之类
+ * 在 DTO 上本来就是可选的。默认值只能有一处真源，那就是 service 里的那几个 `??`。
+ */
+export function validateBrandInput(input: GeoBrandInput): RuleViolation[] {
+  const violations: RuleViolation[] = []
+  violations.push(...checkName(input.name, true))
+  violations.push(...checkDomain(input.domain))
+  violations.push(...checkAliases(input.aliases))
+  violations.push(...checkIndustry(input.industry))
+  violations.push(...checkLocale(input.locale))
+  violations.push(...checkStatus(input.status, false))
+  violations.push(...checkRefreshFreq(input.refreshFreq, false))
+  violations.push(...checkSampleSize(input.sampleSize, false))
+  violations.push(...checkEngineCodes(input.engineCodes))
+  return violations
+}
+
+/**
+ * 修改时的校验：**只校验给了的字段**。
+ *
+ * 与 {@link validateBrandInput} 分成两个函数而不是加一个 `partial` 布尔参数：
+ * 布尔参数的调用点读起来是 `validate(x, true)`，谁也说不清 true 是哪一边。
+ */
+export function validateBrandPatch(patch: GeoBrandInput): RuleViolation[] {
+  const violations: RuleViolation[] = []
+  if (patch.name !== undefined) violations.push(...checkName(patch.name, false))
+  if (patch.domain !== undefined) violations.push(...checkDomain(patch.domain))
+  if (patch.aliases !== undefined) violations.push(...checkAliases(patch.aliases))
+  if (patch.industry !== undefined) violations.push(...checkIndustry(patch.industry))
+  if (patch.locale !== undefined) violations.push(...checkLocale(patch.locale))
+  if (patch.status !== undefined) violations.push(...checkStatus(patch.status, true))
+  if (patch.refreshFreq !== undefined) violations.push(...checkRefreshFreq(patch.refreshFreq, true))
+  if (patch.sampleSize !== undefined) violations.push(...checkSampleSize(patch.sampleSize, true))
+  if (patch.engineCodes !== undefined) violations.push(...checkEngineCodes(patch.engineCodes))
+  return violations
+}
+
+/**
+ * 竞品数上限校验。
+ *
+ * 做成「返回 violation 数组」而不是「抛异常」，与本文件其它函数保持同一种形状：
+ * 纯函数抛业务异常就把 `@taizan/nest-core` 拖进来了，而那正是这个文件要避免的。
+ *
+ * @param currentCount - 当前活跃竞品数
+ * @param adding - 本次要新增几条（改一条已有的传 0）
+ */
+export function assertCompetitorLimit(currentCount: number, adding = 1): RuleViolation[] {
+  if (!Number.isInteger(currentCount) || currentCount < 0) {
+    return [{ field: 'competitors', message: '竞品数必须是非负整数' }]
+  }
+  if (currentCount + adding > MAX_COMPETITORS) {
+    return [
+      {
+        field: 'competitors',
+        message: `一个品牌最多 ${MAX_COMPETITORS} 个竞品（当前 ${currentCount} 个）`,
+      },
+    ]
+  }
+  return []
+}
+
+function checkName(value: unknown, required: boolean): RuleViolation[] {
+  const name = normalizeBrandName(value)
+  if (name === '') {
+    return required || value !== undefined
+      ? [{ field: 'name', message: '品牌名不能为空（去掉首尾空白之后）' }]
+      : []
+  }
+  if ([...name].length > GEO_BRAND_NAME_MAX) {
+    return [{ field: 'name', message: `品牌名不能超过 ${GEO_BRAND_NAME_MAX} 个字` }]
+  }
+  return []
+}
+
+function checkDomain(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null || value === '') return []
+  if (typeof value !== 'string') {
+    return [{ field: 'domain', message: '域名必须是字符串' }]
+  }
+  const domain = normalizeDomain(value)
+  if (domain === null) return []
+  if (domain.length > GEO_BRAND_DOMAIN_MAX) {
+    return [{ field: 'domain', message: `域名不能超过 ${GEO_BRAND_DOMAIN_MAX} 个字符` }]
+  }
+  // 只做形状判断（至少一个点、只含域名允许的字符），不做 DNS 解析——
+  // 解析要联网，而一个刚注册还没解析的域名不该因此建不进来。
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+    return [{ field: 'domain', message: `「${domain}」不像一个域名（形如 example.com）` }]
+  }
+  return []
+}
+
+function checkAliases(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) {
+    return [{ field: 'aliases', message: '别名必须是字符串数组' }]
+  }
+  const aliases = normalizeAliases(value)
+  if (aliases.length > GEO_BRAND_ALIAS_MAX) {
+    return [{ field: 'aliases', message: `别名最多 ${GEO_BRAND_ALIAS_MAX} 条` }]
+  }
+  const tooLong = aliases.find((alias) => [...alias].length > GEO_BRAND_ALIAS_LENGTH_MAX)
+  if (tooLong !== undefined) {
+    return [
+      {
+        field: 'aliases',
+        message: `别名「${tooLong.slice(0, 20)}…」超过 ${GEO_BRAND_ALIAS_LENGTH_MAX} 个字`,
+      },
+    ]
+  }
+  return []
+}
+
+function checkIndustry(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null || value === '') return []
+  if (typeof value !== 'string') {
+    return [{ field: 'industry', message: '行业必须是字符串' }]
+  }
+  if ([...value].length > GEO_INDUSTRY_MAX) {
+    return [{ field: 'industry', message: `行业不能超过 ${GEO_INDUSTRY_MAX} 个字` }]
+  }
+  return []
+}
+
+function checkLocale(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null || value === '') return []
+  if (typeof value !== 'string') {
+    return [{ field: 'locale', message: '语言/地区必须是字符串' }]
+  }
+  if (value.length > GEO_LOCALE_MAX) {
+    return [{ field: 'locale', message: `语言/地区不能超过 ${GEO_LOCALE_MAX} 个字符` }]
+  }
+  // `zh-CN` / `en` / `zh-Hant-TW` 都放行；只挡明显不是标签的输入。
+  if (!/^[a-zA-Z]{2,8}(-[a-zA-Z0-9]{2,8})*$/.test(value)) {
+    return [{ field: 'locale', message: `「${value}」不像一个语言标签（形如 zh-CN）` }]
+  }
+  return []
+}
+
+function checkStatus(value: unknown, provided: boolean): RuleViolation[] {
+  if (value === undefined || value === null) {
+    return provided ? [{ field: 'status', message: '状态不能为空' }] : []
+  }
+  if (!GEO_BRAND_STATUSES.includes(value as GeoBrandStatusLike)) {
+    return [{ field: 'status', message: `状态只能是 ${GEO_BRAND_STATUSES.join(' / ')}` }]
+  }
+  return []
+}
+
+function checkRefreshFreq(value: unknown, provided: boolean): RuleViolation[] {
+  if (value === undefined || value === null) {
+    return provided ? [{ field: 'refreshFreq', message: '刷新频率不能为空' }] : []
+  }
+  if (!GEO_REFRESH_FREQS.includes(value as GeoRefreshFreqLike)) {
+    return [{ field: 'refreshFreq', message: `刷新频率只能是 ${GEO_REFRESH_FREQS.join(' / ')}` }]
+  }
+  return []
+}
+
+function checkSampleSize(value: unknown, provided: boolean): RuleViolation[] {
+  if (value === undefined || value === null) {
+    return provided ? [{ field: 'sampleSize', message: '采样次数不能为空' }] : []
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    return [{ field: 'sampleSize', message: '采样次数必须是整数' }]
+  }
+  if (value < GEO_SAMPLE_SIZE_MIN || value > GEO_SAMPLE_SIZE_MAX) {
+    return [
+      {
+        field: 'sampleSize',
+        message: `采样次数只能在 ${GEO_SAMPLE_SIZE_MIN}–${GEO_SAMPLE_SIZE_MAX} 之间`,
+      },
+    ]
+  }
+  return []
+}
+
+function checkEngineCodes(value: unknown): RuleViolation[] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) {
+    return [{ field: 'engineCodes', message: '引擎必须是字符串数组' }]
+  }
+  const codes = normalizeEngineCodes(value)
+  if (codes.length > GEO_BRAND_ENGINE_MAX) {
+    return [{ field: 'engineCodes', message: `最多同时监测 ${GEO_BRAND_ENGINE_MAX} 个引擎` }]
+  }
+  const bad = codes.find((code) => !/^[a-z0-9][a-z0-9_-]*$/.test(code))
+  if (bad !== undefined) {
+    return [{ field: 'engineCodes', message: `引擎 code「${bad}」只能是小写字母/数字/下划线/连字符` }]
+  }
+  return []
+}

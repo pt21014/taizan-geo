@@ -1,0 +1,118 @@
+/**
+ * `geo-citation.rules.ts` 的单测。
+ *
+ * @packageDocumentation
+ */
+import { describe, expect, it } from 'vitest'
+
+import { buildCitationDrafts, classifySource, type SourceRule } from './geo-citation.rules'
+
+const rules: SourceRule[] = [
+  { pattern: 'baike.baidu.com', platform: '百度百科', category: 'ENCYCLOPEDIA', priority: 10 },
+  { pattern: 'zhihu.com', platform: '知乎', category: 'SOCIAL', priority: 20 },
+  { pattern: '{{rootDomain}}', platform: '通用规则', category: 'PR', priority: 30 },
+  { pattern: '{{rootDomain}}', platform: '被更高优先级挡住的规则', category: 'OTHER', priority: 5 },
+]
+
+describe('classifySource', () => {
+  it('命中 brandDomain → OWNED，platform 复用分类名', () => {
+    const out = classifySource('example.org', [], { brandDomain: 'example.org', competitorDomains: [] })
+    expect(out).toEqual({ platform: 'OWNED', category: 'OWNED' })
+  })
+
+  it('子域命中 brandDomain 同样判 OWNED', () => {
+    const out = classifySource('shop.example.org', [], { brandDomain: 'example.org', competitorDomains: [] })
+    expect(out.category).toBe('OWNED')
+  })
+
+  it('命中 competitorDomains → COMPETITOR', () => {
+    const out = classifySource('rival.com', [], { brandDomain: 'example.org', competitorDomains: ['rival.com'] })
+    expect(out).toEqual({ platform: 'COMPETITOR', category: 'COMPETITOR' })
+  })
+
+  it('OWNED 优先于 COMPETITOR（同一个域名理论上不该同时出现在两边，但 OWNED 判定顺序在前）', () => {
+    const out = classifySource('example.org', [], { brandDomain: 'example.org', competitorDomains: ['example.org'] })
+    expect(out.category).toBe('OWNED')
+  })
+
+  it('按 rules 匹配，域名后缀命中含子域', () => {
+    const out = classifySource('x.baike.baidu.com', rules, { competitorDomains: [] })
+    expect(out).toEqual({ platform: '百度百科', category: 'ENCYCLOPEDIA' })
+  })
+
+  it('多条规则命中同一域名时取 priority 最小的', () => {
+    const out = classifySource('{{rootDomain}}', rules, { competitorDomains: [] })
+    expect(out).toEqual({ platform: '被更高优先级挡住的规则', category: 'OTHER' })
+  })
+
+  it('都不命中 → OTHER', () => {
+    const out = classifySource('random-site.io', rules, { brandDomain: 'example.org', competitorDomains: [] })
+    expect(out).toEqual({ platform: 'OTHER', category: 'OTHER' })
+  })
+
+  it('空域名 → OTHER', () => {
+    expect(classifySource('', rules, { competitorDomains: [] })).toEqual({ platform: 'OTHER', category: 'OTHER' })
+  })
+
+  it('没有 brandDomain 时不误判 OWNED', () => {
+    const out = classifySource('example.org', rules, { competitorDomains: [] })
+    expect(out.category).toBe('OTHER')
+  })
+})
+
+describe('buildCitationDrafts', () => {
+  it('空数组 → 空数组', () => {
+    expect(buildCitationDrafts([], rules, { competitorDomains: [] })).toEqual([])
+  })
+
+  it('rank 从 1 开始按去重后顺序递增', () => {
+    const out = buildCitationDrafts(
+      [{ url: 'https://zhihu.com/q/1' }, { url: 'https://baike.baidu.com/item/x' }],
+      rules,
+      { competitorDomains: [] },
+    )
+    expect(out.map((d) => d.rank)).toEqual([1, 2])
+  })
+
+  it('去重同一 URL（归一化后相同），保留首次出现并补全缺失字段', () => {
+    const out = buildCitationDrafts(
+      [
+        { url: 'https://zhihu.com/q/1?utm_source=x' },
+        { url: 'https://zhihu.com/q/1', title: '补上的标题' },
+      ],
+      rules,
+      { competitorDomains: [] },
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0]?.title).toBe('补上的标题')
+  })
+
+  it('domain 与 category/platform 正确写入', () => {
+    const out = buildCitationDrafts([{ url: 'https://www.zhihu.com/q/1' }], rules, {
+      brandDomain: 'example.org',
+      competitorDomains: [],
+    })
+    expect(out[0]?.domain).toBe('zhihu.com')
+    expect(out[0]?.platform).toBe('知乎')
+    expect(out[0]?.category).toBe('SOCIAL')
+  })
+
+  it('urlHash 是确定性的 sha256 hex，且同 URL 得到同 hash', () => {
+    const out = buildCitationDrafts([{ url: 'https://zhihu.com/q/1' }], rules, { competitorDomains: [] })
+    expect(out[0]?.urlHash).toMatch(/^[0-9a-f]{64}$/)
+    const again = buildCitationDrafts([{ url: 'https://zhihu.com/q/1' }], rules, { competitorDomains: [] })
+    expect(again[0]?.urlHash).toBe(out[0]?.urlHash)
+  })
+
+  it('没有 title 时不写入 title 字段', () => {
+    const out = buildCitationDrafts([{ url: 'https://zhihu.com/q/1' }], rules, { competitorDomains: [] })
+    expect(out[0]?.title).toBeUndefined()
+  })
+
+  it('空 url 的条目被丢弃', () => {
+    const out = buildCitationDrafts([{ url: '' }, { url: 'https://zhihu.com/q/1' }], rules, {
+      competitorDomains: [],
+    })
+    expect(out).toHaveLength(1)
+  })
+})
