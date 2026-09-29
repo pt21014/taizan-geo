@@ -317,4 +317,4 @@ taizan-saas 是一套「多租户 SaaS 地基」：`@taizan/*` npm 包 + `create
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 neal
+[MIT](LICENSE) © 2026 钛赞
